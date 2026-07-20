@@ -1,8 +1,9 @@
 class AgentPresence < Formula
   desc "Discord Rich Presence for Claude Code and Codex"
   homepage "https://github.com/jx-grxf/agent-presence"
-  version "@@VERSION@@"
   license "MIT"
+  # No `version` stanza: Homebrew scans it from the URL, and `brew audit --strict`
+  # rejects stating it twice.
 
   on_macos do
     on_arm do
