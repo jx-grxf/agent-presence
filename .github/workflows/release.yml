@@ -76,8 +76,6 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
-    env:
-      PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -96,20 +94,23 @@ jobs:
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           packaging/render.sh "$tag" dist rendered
 
-      # Both taps live in their own repos, so this needs a token with write access to
-      # them. Without the secret the release still publishes; only the taps go stale.
+      # The taps live in their own repositories, each reached with its own deploy key so
+      # neither secret can write anywhere else. A missing key skips the update rather
+      # than failing the release.
       - name: Update Homebrew tap
-        if: env.PACKAGES_TOKEN != ''
+        env:
+          DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           packaging/publish.sh \
-            "https://x-access-token:${PACKAGES_TOKEN}@github.com/jx-grxf/homebrew-tap.git" \
+            git@github.com:jx-grxf/homebrew-tap.git \
             rendered/agent-presence.rb Formula/agent-presence.rb \
             "${{ github.event.inputs.tag || github.ref_name }}"
 
       - name: Update Scoop bucket
-        if: env.PACKAGES_TOKEN != ''
+        env:
+          DEPLOY_KEY: ${{ secrets.BUCKET_DEPLOY_KEY }}
         run: |
           packaging/publish.sh \
-            "https://x-access-token:${PACKAGES_TOKEN}@github.com/jx-grxf/scoop-bucket.git" \
+            git@github.com:jx-grxf/scoop-bucket.git \
             rendered/agent-presence.json bucket/agent-presence.json \
             "${{ github.event.inputs.tag || github.ref_name }}"
