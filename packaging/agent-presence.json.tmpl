@@ -11,10 +11,14 @@
     }
   },
   "bin": "agent-presence.exe",
+  "post_install": [
+    "# Scoop runs this unsandboxed, so the hooks can be wired up for you.",
+    "& \"$dir\\agent-presence.exe\" install"
+  ],
   "notes": [
-    "Wire it into the agents you have installed:",
-    "  agent-presence install",
-    "  agent-presence doctor"
+    "Hooks are installed. Restart your agent, then:",
+    "  agent-presence doctor   # verify",
+    "  agent-presence config   # choose what is shown"
   ],
   "checkver": {
     "github": "https://github.com/jx-grxf/agent-presence"

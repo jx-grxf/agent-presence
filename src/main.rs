@@ -5,6 +5,7 @@ mod event;
 mod hook;
 mod install;
 mod ipc;
+mod onboarding;
 mod tui;
 mod ui;
 
@@ -23,8 +24,10 @@ pub const DEFAULT_CLIENT_ID: &str = "1528707412352172162";
     about = "Discord Rich Presence for Claude Code and Codex"
 )]
 struct Cli {
+    /// Bare `agent-presence` runs setup. Homebrew's sandbox forbids a formula from
+    /// touching `~/.claude`, so the shortest possible first run matters.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -68,7 +71,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let command = Cli::parse().command;
+    let Some(command) = Cli::parse().command else {
+        init_logging(false);
+        // Probe Discord before the wizard takes over the screen: the answer cannot
+        // change while it is open, and an async call inside a draw callback cannot.
+        return onboarding::run(probe_discord().await);
+    };
     init_logging(matches!(command, Command::Hook { .. } | Command::Daemon));
 
     match command {
@@ -115,6 +123,19 @@ fn init_logging(to_file: bool) {
         }
     }
     builder.with_writer(std::io::stderr).init();
+}
+
+/// `None` means Discord answered the handshake; `Some` carries why it did not.
+async fn probe_discord() -> Option<String> {
+    let id = config::Config::load().effective_client_id();
+    if id.is_empty() {
+        return Some("no Application ID configured".into());
+    }
+    discord::DiscordClient::new(id)
+        .connect()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
 }
 
 fn status() -> Result<()> {

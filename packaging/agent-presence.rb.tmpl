@@ -27,11 +27,16 @@ class AgentPresence < Formula
     bin.install "agent-presence"
   end
 
+  # Deliberately not a post_install hook: Homebrew sandboxes it and a formula must not
+  # write outside the prefix, so wiring ~/.claude and ~/.codex is the user's call.
   def caveats
     <<~EOS
-      Wire it into the agents you have installed:
-        agent-presence install
-        agent-presence doctor
+      One command left — it detects Claude Code and Codex and wires them up:
+
+        agent-presence
+
+      Then `agent-presence config` to choose what the card shows.
+      Nothing identifying is shown by default.
     EOS
   end
 

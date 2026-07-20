@@ -56,58 +56,90 @@ pub fn is_installed(path: &Path) -> bool {
     text.contains("agent-presence")
 }
 
-pub fn run(uninstall: bool, only: Option<Agent>) -> Result<()> {
+/// What `apply` did to one agent's config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The agent is not installed on this machine.
+    Absent,
+    Changed,
+    /// Already pointing at this binary.
+    Unchanged,
+}
+
+/// The install itself, with no output of its own, so both the CLI and the onboarding
+/// wizard can drive it — a `println!` from inside a full-screen TUI would corrupt it.
+pub fn apply(uninstall: bool, only: Option<Agent>) -> Result<Vec<(Agent, Outcome)>> {
     let agents = match only {
         Some(a) => vec![a],
         None => vec![Agent::Claude, Agent::Codex],
     };
 
-    ui::heading(if uninstall {
-        "Removing hooks"
-    } else {
-        "Wiring up your agents"
-    });
-
-    let mut touched = 0;
+    let mut results = Vec::new();
     for agent in agents {
         let path = config_file(agent);
         // Only touch an agent the user actually has installed, unless we are cleaning up.
-        if !uninstall && !path.parent().map(Path::exists).unwrap_or(false) {
-            ui::field(
-                "",
-                &ui::dim(&format!("{} not installed, skipping", agent.label())),
-            );
-            continue;
-        }
-        if uninstall && !path.exists() {
+        let present = path.parent().map(Path::exists).unwrap_or(false);
+        if (!uninstall && !present) || (uninstall && !path.exists()) {
+            results.push((agent, Outcome::Absent));
             continue;
         }
 
-        // A spinner for a file write is theatre; the pause is real only on a cold FS
-        // cache, so it resolves immediately in the common case.
-        let spinner = ui::Spinner::start(format!("{}…", agent.label()));
         let mut root = read_json(&path)?;
         let changed = if uninstall {
             remove_hooks(&mut root)
         } else {
             add_hooks(&mut root, agent)?
         };
-
         if changed {
             write_json(&path, &root)?;
-            touched += 1;
-            let verb = if uninstall { "removed from" } else { "→" };
-            spinner.succeed(&format!(
-                "{} {verb} {}",
-                agent.label(),
-                ui::dim(&path.display().to_string())
-            ));
-        } else {
-            spinner.succeed(&format!(
+        }
+        results.push((
+            agent,
+            if changed {
+                Outcome::Changed
+            } else {
+                Outcome::Unchanged
+            },
+        ));
+    }
+    Ok(results)
+}
+
+pub fn run(uninstall: bool, only: Option<Agent>) -> Result<()> {
+    ui::heading(if uninstall {
+        "Removing hooks"
+    } else {
+        "Wiring up your agents"
+    });
+
+    // A spinner for a few file writes is theatre; it resolves immediately unless the
+    // filesystem cache is cold, which is exactly when the feedback is worth having.
+    let spinner = ui::Spinner::start("reading agent configuration…");
+    let results = apply(uninstall, only)?;
+    drop(spinner);
+
+    let mut touched = 0;
+    for (agent, outcome) in results {
+        let path = config_file(agent);
+        match outcome {
+            Outcome::Absent => ui::field(
+                "",
+                &ui::dim(&format!("{} not installed, skipping", agent.label())),
+            ),
+            Outcome::Changed => {
+                touched += 1;
+                let verb = if uninstall { "removed from" } else { "→" };
+                ui::ok(&format!(
+                    "{} {verb} {}",
+                    agent.label(),
+                    ui::dim(&path.display().to_string())
+                ));
+            }
+            Outcome::Unchanged => ui::ok(&format!(
                 "{} {}",
                 agent.label(),
                 ui::dim("already up to date")
-            ));
+            )),
         }
     }
 

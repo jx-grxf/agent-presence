@@ -61,12 +61,32 @@ still needed, see [`plugin/`](plugin/README.md):
 /plugin install agent-presence@jx-grxf
 ```
 
-Then wire it into whichever agents you have installed:
+Scoop wires up your agents during install. Homebrew cannot — a formula runs sandboxed
+and must not write outside its prefix — so on macOS and Linux, run it once:
 
 ```bash
-agent-presence install     # detects Claude Code and Codex
-agent-presence doctor      # verifies Discord, hooks and daemon
+agent-presence
 ```
+
+```
+agent-presence  ● ● ○ ○ ○
+
+│  How much should the card reveal?
+│
+│  ←  generic  →
+│  Nothing identifying. No repository name, no branch, no file names.
+│
+│  This is what everyone on Discord would see:
+│    Agent
+│    Claude Code
+│    Editing code · Opus 4.8
+
+  ←→ change · enter continue · q quit
+```
+
+It detects which agents you have, asks the two questions that matter, installs the
+hooks, and reads the files back to confirm. Quitting before the install step leaves
+your machine exactly as it was.
 
 That is the whole setup. The daemon starts itself with your next session and shuts
 down on its own once you stop coding.
