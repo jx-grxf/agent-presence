@@ -1,7 +1,7 @@
 {
   "name": "agent-presence",
   "description": "Discord Rich Presence for Claude Code — shows what your agent is doing on your Discord profile",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "homepage": "https://github.com/jx-grxf/agent-presence",
   "license": "MIT"
 }

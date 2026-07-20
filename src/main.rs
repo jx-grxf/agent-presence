@@ -5,6 +5,8 @@ mod event;
 mod hook;
 mod install;
 mod ipc;
+mod tui;
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -43,6 +45,8 @@ enum Command {
         #[arg(long)]
         agent: Option<Agent>,
     },
+    /// Edit settings in an interactive menu.
+    Config,
     /// Show daemon, config and Discord status.
     Status,
     /// Diagnose a setup that is not showing a card.
@@ -72,6 +76,7 @@ async fn main() -> Result<()> {
         Command::Hook { agent } => hook::run(agent).await,
         Command::Daemon => daemon::run().await?,
         Command::Install { uninstall, agent } => install::run(uninstall, agent)?,
+        Command::Config => tui::run()?,
         Command::Status => status()?,
         Command::Doctor => doctor().await?,
         Command::Stop => stop()?,
@@ -88,8 +93,15 @@ async fn main() -> Result<()> {
 /// Hooks and the daemon log to a file; everything else logs to stderr. stdout stays
 /// clean in all cases — Claude Code feeds hook stdout into the model's context.
 fn init_logging(to_file: bool) {
+    // Interactive commands print their own report; an INFO line landing mid-spinner
+    // would interleave with it. `AGENT_PRESENCE_LOG` still overrides both defaults.
+    let default = if to_file {
+        "agent_presence=info"
+    } else {
+        "agent_presence=warn"
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_env("AGENT_PRESENCE_LOG")
-        .unwrap_or_else(|_| "agent_presence=info".into());
+        .unwrap_or_else(|_| default.into());
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
 
     if to_file {
@@ -107,46 +119,122 @@ fn init_logging(to_file: bool) {
 
 fn status() -> Result<()> {
     let config = config::Config::load();
+
+    ui::heading("Daemon");
     match daemon::running_pid() {
-        Some(pid) => println!("daemon:   running (pid {pid})"),
-        None => println!("daemon:   not running"),
+        Some(pid) => ui::ok(&format!("running {}", ui::dim(&format!("pid {pid}")))),
+        None => ui::field(
+            "state",
+            &ui::dim("not running — starts with your next session"),
+        ),
     }
-    println!("config:   {}", config::config_path().display());
-    println!("detail:   {:?}", config.detail);
-    println!("enabled:  {}", config.enabled);
-    println!(
-        "client:   {}",
-        if config.effective_client_id().is_empty() {
-            "NOT SET — see README, create a Discord application".to_string()
+
+    ui::heading("Settings");
+    ui::field("detail", &format!("{:?}", config.detail).to_lowercase());
+    ui::field("model", if config.show_model { "shown" } else { "hidden" });
+    ui::field(
+        "focus",
+        if config.follow_focus {
+            "follows the focused window"
         } else {
-            config.effective_client_id()
-        }
+            "most recent session"
+        },
     );
-    println!("log:      {}", config::log_path().display());
+    let enabled = if config.enabled {
+        "yes".to_string()
+    } else {
+        ui::yellow("no — card is suppressed")
+    };
+    ui::field("enabled", &enabled);
+    ui::field("app id", &config.effective_client_id());
+
+    ui::heading("Paths");
+    ui::field(
+        "config",
+        &ui::dim(&config::config_path().display().to_string()),
+    );
+    ui::field("log", &ui::dim(&config::log_path().display().to_string()));
+
+    println!(
+        "\n{}",
+        ui::dim("  Change any of this with `agent-presence config`.")
+    );
     Ok(())
 }
 
 async fn doctor() -> Result<()> {
-    status()?;
-    println!();
+    let config = config::Config::load();
 
-    let id = config::Config::load().effective_client_id();
+    ui::heading("Discord");
+    let id = config.effective_client_id();
     if id.is_empty() {
-        println!("✗ no Discord Application ID configured");
-        return Ok(());
+        ui::fail("no Application ID configured — see README");
+    } else {
+        let spinner = ui::Spinner::start("connecting to the Discord desktop client…");
+        match discord::DiscordClient::new(id).connect().await {
+            Ok(()) => spinner.succeed("IPC reachable, handshake accepted"),
+            Err(e) => {
+                spinner.fail_with(&format!("{e:#}"));
+                println!(
+                    "{}",
+                    ui::dim(
+                        "    The browser client has no IPC socket — the desktop app is required."
+                    )
+                );
+            }
+        }
     }
-    match discord::DiscordClient::new(id).connect().await {
-        Ok(()) => println!("✓ Discord IPC reachable and handshake accepted"),
-        Err(e) => println!("✗ Discord: {e:#}"),
-    }
+
+    ui::heading("Hooks");
+    let mut any = false;
     for (agent, path) in install::installed_paths() {
-        let state = if install::is_installed(&path) {
-            "✓ hooks installed"
+        let present = path.parent().map(std::path::Path::exists).unwrap_or(false);
+        if install::is_installed(&path) {
+            any = true;
+            ui::ok(&format!(
+                "{} {}",
+                agent.label(),
+                ui::dim(&path.display().to_string())
+            ));
+        } else if present {
+            ui::fail(&format!(
+                "{} found, but no hooks — run `agent-presence install`",
+                agent.label()
+            ));
         } else {
-            "✗ hooks missing"
-        };
-        println!("{state} for {} ({})", agent.label(), path.display());
+            ui::field(
+                "",
+                &ui::dim(&format!("{} not installed on this machine", agent.label())),
+            );
+        }
     }
+    if !any {
+        ui::warn("no agent is wired up yet — run `agent-presence install`");
+    }
+
+    ui::heading("Daemon");
+    match daemon::running_pid() {
+        Some(pid) => ui::ok(&format!("running {}", ui::dim(&format!("pid {pid}")))),
+        None => ui::warn("not running — it starts itself with your next session"),
+    }
+
+    ui::heading("Card preview");
+    let (details, state) = tui::preview_card(&config);
+    for line in ui::card("Agent", &details, &state, "12:34 elapsed") {
+        println!("  {line}");
+    }
+    if config.detail != config::Detail::Generic {
+        println!(
+            "\n  {} {}",
+            ui::yellow("!"),
+            ui::dim("detail is not generic — the project name above is visible to everyone.")
+        );
+    }
+
+    println!(
+        "\n{}",
+        ui::dim("  Still no card? Discord → Settings → Activity Privacy → \"Display current activity\".")
+    );
     Ok(())
 }
 

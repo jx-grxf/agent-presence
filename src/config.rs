@@ -19,6 +19,12 @@ pub enum Detail {
     Full,
 }
 
+/// Prepended on save, since `toml` drops the doc comments below.
+const CONFIG_HEADER: &str = "\
+# agent-presence — edit by hand, or run `agent-presence config` for a menu.
+# https://github.com/jx-grxf/agent-presence#privacy
+";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -80,6 +86,19 @@ impl Config {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Write the config back out. Only reached from the editor, so a partial write
+    /// would cost the user their settings — hence the temp-file swap.
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let body = format!("{}\n{}", CONFIG_HEADER, toml::to_string_pretty(self)?);
+
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 
     pub fn effective_client_id(&self) -> String {

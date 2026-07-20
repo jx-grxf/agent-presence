@@ -29,7 +29,7 @@ A single static binary. No Node, no Python, no bot token.
 ## Why another one?
 
 Existing Discord presence tools for Claude Code are Node or Python scripts that only
-cover one agent, and often only one OS. `agent-presence` is one ~1 MB binary that:
+cover one agent, and often only one OS. `agent-presence` is one ~1.5 MB binary that:
 
 - supports **both Claude Code and Codex** from one daemon
 - runs on **macOS, Windows and Linux**
@@ -82,7 +82,27 @@ agent-presence install --uninstall
 The default card shows **no repository name, no branch, and no file names**. It says
 which agent is running, what kind of work it is doing, and how long you have been at it.
 
-Anything more is opt-in, in `~/.config/agent-presence/config.toml`:
+Anything more is opt-in. Either run the settings menu, which previews the card live as
+you change things:
+
+```bash
+agent-presence config
+```
+
+```
+  Detail           project
+  Show model       on
+  Follow focus     on
+  ┌─ preview — visible to everyone on Discord ─┐
+  │ Agent                                      │
+  │ agent-presence · main                      │
+  │ Editing code · Opus 4.8                    │
+  └────────────────────────────────────────────┘
+  ↑↓ move · ←→/space change · enter edit · s save · q quit
+```
+
+…or edit `~/.config/agent-presence/config.toml` by hand — it stays the source of truth,
+and the menu is only a front end for it:
 
 ```toml
 # "generic" (default) · "project" · "full"
@@ -189,6 +209,7 @@ If Discord is closed, the daemon keeps running and reconnects when it comes back
 |---|---|
 | `agent-presence install` | Add hooks to Claude Code and Codex |
 | `agent-presence install --uninstall` | Remove them again |
+| `agent-presence config` | Edit settings in a menu, with a live card preview |
 | `agent-presence status` | Daemon, config and Application ID |
 | `agent-presence doctor` | Diagnose a card that is not appearing |
 | `agent-presence stop` | Stop the daemon |

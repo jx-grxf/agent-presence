@@ -6,6 +6,7 @@
 
 use crate::config;
 use crate::event::Agent;
+use crate::ui;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -61,14 +62,20 @@ pub fn run(uninstall: bool, only: Option<Agent>) -> Result<()> {
         None => vec![Agent::Claude, Agent::Codex],
     };
 
+    ui::heading(if uninstall {
+        "Removing hooks"
+    } else {
+        "Wiring up your agents"
+    });
+
+    let mut touched = 0;
     for agent in agents {
         let path = config_file(agent);
         // Only touch an agent the user actually has installed, unless we are cleaning up.
         if !uninstall && !path.parent().map(Path::exists).unwrap_or(false) {
-            println!(
-                "- {} not found, skipping ({})",
-                agent.label(),
-                path.display()
+            ui::field(
+                "",
+                &ui::dim(&format!("{} not installed, skipping", agent.label())),
             );
             continue;
         }
@@ -76,6 +83,9 @@ pub fn run(uninstall: bool, only: Option<Agent>) -> Result<()> {
             continue;
         }
 
+        // A spinner for a file write is theatre; the pause is real only on a cold FS
+        // cache, so it resolves immediately in the common case.
+        let spinner = ui::Spinner::start(format!("{}…", agent.label()));
         let mut root = read_json(&path)?;
         let changed = if uninstall {
             remove_hooks(&mut root)
@@ -85,20 +95,52 @@ pub fn run(uninstall: bool, only: Option<Agent>) -> Result<()> {
 
         if changed {
             write_json(&path, &root)?;
-            let verb = if uninstall {
-                "removed from"
-            } else {
-                "installed into"
-            };
-            println!("✓ {} hooks {verb} {}", agent.label(), path.display());
+            touched += 1;
+            let verb = if uninstall { "removed from" } else { "→" };
+            spinner.succeed(&format!(
+                "{} {verb} {}",
+                agent.label(),
+                ui::dim(&path.display().to_string())
+            ));
         } else {
-            println!("· {} already up to date", agent.label());
+            spinner.succeed(&format!(
+                "{} {}",
+                agent.label(),
+                ui::dim("already up to date")
+            ));
         }
     }
 
-    if !uninstall {
-        println!("\nRun `agent-presence doctor` to verify, then start a session.");
+    if uninstall {
+        println!(
+            "\n{}",
+            ui::dim(
+                "  Hooks gone. Config and logs are untouched — delete them by hand if you want."
+            )
+        );
+        return Ok(());
     }
+
+    ui::heading("Next");
+    if touched > 0 {
+        ui::field("1", "restart the agent — it reads hooks at startup");
+    }
+    ui::field(
+        "2",
+        &format!("{} to verify", ui::cyan("agent-presence doctor")),
+    );
+    ui::field(
+        "3",
+        &format!(
+            "{} to change what is shown",
+            ui::cyan("agent-presence config")
+        ),
+    );
+    println!(
+        "\n  {} {}",
+        ui::green("✓"),
+        ui::dim("nothing identifying is shown by default.")
+    );
     Ok(())
 }
 
