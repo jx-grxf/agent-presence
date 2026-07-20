@@ -44,7 +44,10 @@ if git diff --cached --quiet; then
   exit 0
 fi
 
-git -c user.name="release" -c user.email="release@users.noreply.github.com" \
+# The owner's GitHub noreply address. A plausible-looking address like
+# "release@users.noreply.github.com" belongs to a real, unrelated account, and GitHub
+# would attribute every release commit to that stranger.
+git -c user.name="jx-grxf" -c user.email="147989511+jx-grxf@users.noreply.github.com" \
   commit -q -m "agent-presence ${tag}"
 git push -q origin HEAD
 echo "published $dest at $tag"

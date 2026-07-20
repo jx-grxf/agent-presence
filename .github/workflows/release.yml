@@ -83,10 +83,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Hand-written notes lead; the generated commit list is appended below them.
+      - name: Collect release notes
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          {
+            echo 'RELEASE_BODY<<NOTES_EOF'
+            packaging/release-notes.sh "$tag"
+            echo 'NOTES_EOF'
+          } >> "$GITHUB_ENV"
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/*
+          body: ${{ env.RELEASE_BODY }}
           generate_release_notes: true
 
       - name: Render package manifests
