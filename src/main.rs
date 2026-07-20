@@ -12,7 +12,7 @@ use event::Agent;
 
 /// Default Discord Application ID. Public value, not a secret — Rich Presence
 /// authenticates through the logged-in Discord desktop client, never a token.
-pub const DEFAULT_CLIENT_ID: &str = "";
+pub const DEFAULT_CLIENT_ID: &str = "1528707412352172162";
 
 #[derive(Parser)]
 #[command(
