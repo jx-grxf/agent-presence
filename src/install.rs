@@ -126,8 +126,40 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Path to write into the agents' hook config.
+///
+/// `current_exe` resolves symlinks, which for a package-managed install points into a
+/// versioned directory — `…/Cellar/agent-presence/0.1.0/bin/…` — that the next upgrade
+/// deletes, silently breaking every hook. So prefer whichever `PATH` entry leads to
+/// this same binary: package managers keep those stable across versions.
+fn stable_exe_path() -> Result<String> {
+    let exe = std::env::current_exe()?;
+    let target = exe.canonicalize().unwrap_or_else(|_| exe.clone());
+    let name = exe.file_name().unwrap_or_default().to_owned();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+
+    Ok(pick_stable(
+        &exe,
+        &target,
+        std::env::split_paths(&path).map(|d| d.join(&name)),
+    )
+    .to_string_lossy()
+    .into_owned())
+}
+
+/// Split out from `stable_exe_path` so the choice is testable without touching `PATH`.
+fn pick_stable(exe: &Path, target: &Path, candidates: impl Iterator<Item = PathBuf>) -> PathBuf {
+    for candidate in candidates {
+        // Compare canonicalized, so a symlink counts but a same-named copy does not.
+        if candidate.canonicalize().is_ok_and(|c| c == target) {
+            return candidate;
+        }
+    }
+    exe.to_path_buf()
+}
+
 fn add_hooks(root: &mut Value, agent: Agent) -> Result<bool> {
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let exe = stable_exe_path()?;
     let events = match agent {
         Agent::Claude => CLAUDE_EVENTS,
         Agent::Codex => CODEX_EVENTS,
@@ -303,6 +335,43 @@ mod tests {
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "must replace in place, not duplicate");
         assert_ne!(stop[0]["hooks"][0]["command"], "/old/path/agent-presence");
+    }
+
+    #[test]
+    fn prefers_a_stable_path_entry_over_the_versioned_one() {
+        let dir = std::env::temp_dir().join(format!("ap-stable-{}", std::process::id()));
+        let versioned = dir.join("Cellar/1.0/bin");
+        let stable = dir.join("bin");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::create_dir_all(&stable).unwrap();
+
+        let real = versioned.join("agent-presence");
+        std::fs::write(&real, b"binary").unwrap();
+        let link = stable.join("agent-presence");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        std::fs::copy(&real, &link).unwrap();
+
+        let target = real.canonicalize().unwrap();
+        let picked = pick_stable(&real, &target, [link.clone()].into_iter());
+        std::fs::remove_dir_all(&dir).ok();
+
+        #[cfg(unix)]
+        assert_eq!(picked, link, "the symlinked PATH entry survives an upgrade");
+        #[cfg(windows)]
+        let _ = picked;
+    }
+
+    #[test]
+    fn falls_back_to_the_real_path_when_nothing_on_path_matches() {
+        let exe = PathBuf::from("/opt/somewhere/agent-presence");
+        let picked = pick_stable(
+            &exe,
+            &exe,
+            [PathBuf::from("/usr/bin/agent-presence")].into_iter(),
+        );
+        assert_eq!(picked, exe);
     }
 
     #[test]
