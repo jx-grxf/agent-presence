@@ -27,10 +27,13 @@ async fn try_run(agent: Agent) -> Result<()> {
     std::io::stdin().read_to_string(&mut raw)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
-    let event = HookEvent::parse(agent, &value)?;
+    let mut event = HookEvent::parse(agent, &value)?;
     if event.kind == EventKind::Ignored {
         return Ok(());
     }
+    // The agent inherits the terminal we are running under, so our own controlling
+    // terminal identifies the window the session lives in.
+    event.tty = controlling_tty();
 
     let socket = config::control_socket_path();
     let deadline = ipc::HOOK_TIMEOUT;
@@ -53,6 +56,38 @@ async fn try_run(agent: Agent) -> Result<()> {
         }
         Err(_) => anyhow::bail!("daemon did not accept the event within {deadline:?}"),
     }
+}
+
+/// Path of this process's controlling terminal, e.g. `/dev/ttys004`.
+///
+/// stdin carries the hook payload and stdout/stderr may be redirected, so the terminal
+/// is resolved through `/dev/tty` rather than any of the standard descriptors. Returns
+/// `None` when the agent runs without a terminal at all (CI, an IDE integration).
+#[cfg(unix)]
+fn controlling_tty() -> Option<String> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    let name = unsafe { ttyname(tty.as_raw_fd()) };
+    if name.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(unix))]
+fn controlling_tty() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn ttyname(fd: i32) -> *const std::os::raw::c_char;
 }
 
 /// Launch the daemon fully detached, so it outlives this hook and the agent session.

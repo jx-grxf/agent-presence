@@ -98,6 +98,11 @@ pub struct HookEvent {
     /// `detail = "full"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Controlling terminal of the agent process, e.g. `/dev/ttys004`. Neither agent
+    /// reports this, so the hook fills it in from its own process — see `hook.rs`. Used
+    /// only to match the session against the focused terminal window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
 }
 
 impl HookEvent {
@@ -143,6 +148,7 @@ impl HookEvent {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
             target: extract_target(tool_name, &raw["tool_input"]),
+            tty: None,
         })
     }
 }

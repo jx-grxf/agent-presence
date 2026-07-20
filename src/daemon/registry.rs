@@ -1,5 +1,6 @@
 //! Tracks every live agent session and decides which one the card represents.
 
+use super::focus::{self, FocusHint};
 use crate::event::{Activity, Agent, EventKind, HookEvent};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -11,6 +12,8 @@ pub struct Session {
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub target: Option<String>,
+    /// Terminal the session runs in, when the hook could determine one.
+    pub tty: Option<String>,
     /// Wall-clock start, as unix seconds, for Discord's elapsed timer.
     pub started_unix: u64,
     pub started: Instant,
@@ -59,6 +62,7 @@ impl Registry {
                         cwd: event.cwd.clone(),
                         model: event.model.clone(),
                         target: event.target.clone(),
+                        tty: event.tty.clone(),
                         started_unix: unix_now(),
                         started: now,
                         last_seen: now,
@@ -72,6 +76,9 @@ impl Registry {
                 }
                 if event.model.is_some() {
                     entry.model = event.model;
+                }
+                if event.tty.is_some() {
+                    entry.tty = event.tty;
                 }
             }
         }
@@ -90,19 +97,43 @@ impl Registry {
         self.sessions.is_empty()
     }
 
+    /// Whether resolving the focused window is worth the cost this tick.
+    pub fn has_multiple(&self) -> bool {
+        self.sessions.len() > 1
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Option<Snapshot> {
-        // Most recent activity wins the card. Ties are broken by start time so the
-        // result is deterministic rather than dependent on HashMap ordering.
-        let primary = self
-            .sessions
-            .values()
-            .max_by_key(|s| (s.last_seen, s.started))?
-            .clone();
+        self.snapshot_focused(None)
+    }
+
+    /// Pick the session the card describes. The focused terminal wins when we can
+    /// identify it; otherwise the most recently active session does, which is also the
+    /// fallback when the focused window holds no agent session at all.
+    pub fn snapshot_focused(&self, hint: Option<&FocusHint>) -> Option<Snapshot> {
+        let focused = hint.and_then(|h| {
+            self.sessions
+                .values()
+                .filter(|s| matches_hint(s, h))
+                // Several sessions can share one cwd; the busier one is the better guess.
+                .max_by_key(|s| (s.last_seen, s.started))
+        });
+
+        // Ties are broken by start time so the result is deterministic rather than
+        // dependent on HashMap ordering.
+        let primary = match focused {
+            Some(s) => s.clone(),
+            None => self
+                .sessions
+                .values()
+                .max_by_key(|s| (s.last_seen, s.started))?
+                .clone(),
+        };
         let oldest_start_unix = self
             .sessions
             .values()
@@ -114,6 +145,17 @@ impl Registry {
             others: self.sessions.len() - 1,
             oldest_start_unix,
         })
+    }
+}
+
+fn matches_hint(session: &Session, hint: &FocusHint) -> bool {
+    match hint {
+        FocusHint::Tty(tty) => session.tty.as_deref() == Some(tty.as_str()),
+        FocusHint::Cwd(cwd) => session
+            .cwd
+            .as_deref()
+            .map(focus::normalize_cwd)
+            .is_some_and(|c| c == *cwd),
     }
 }
 
@@ -136,6 +178,14 @@ mod tests {
             cwd: Some("/repo".into()),
             model: Some("claude-opus-4-8".into()),
             target: None,
+            tty: None,
+        }
+    }
+
+    fn ev_in(session: &str, kind: EventKind, tty: &str) -> HookEvent {
+        HookEvent {
+            tty: Some(tty.into()),
+            ..ev(session, kind)
         }
     }
 
@@ -182,6 +232,59 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(r.expire(Duration::from_millis(1)), 1);
         assert!(r.snapshot().is_none());
+    }
+
+    #[test]
+    fn focused_window_beats_recent_activity() {
+        let mut r = Registry::default();
+        r.apply(ev_in(
+            "front",
+            EventKind::Activity(Activity::Reading),
+            "/dev/ttys001",
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        r.apply(ev_in(
+            "back",
+            EventKind::Activity(Activity::Editing),
+            "/dev/ttys002",
+        ));
+
+        let hint = FocusHint::Tty("/dev/ttys001".into());
+        let snap = r.snapshot_focused(Some(&hint)).unwrap();
+        assert_eq!(
+            snap.primary.activity,
+            Activity::Reading,
+            "the focused window wins even though the other session is newer"
+        );
+    }
+
+    #[test]
+    fn unmatched_hint_falls_back_to_last_active() {
+        let mut r = Registry::default();
+        r.apply(ev_in(
+            "a",
+            EventKind::Activity(Activity::Reading),
+            "/dev/ttys001",
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        r.apply(ev_in(
+            "b",
+            EventKind::Activity(Activity::Editing),
+            "/dev/ttys002",
+        ));
+
+        // A focused terminal running no agent must not blank the card.
+        let hint = FocusHint::Tty("/dev/ttys009".into());
+        let snap = r.snapshot_focused(Some(&hint)).unwrap();
+        assert_eq!(snap.primary.activity, Activity::Editing);
+    }
+
+    #[test]
+    fn cwd_hint_matches_despite_trailing_slash() {
+        let mut r = Registry::default();
+        r.apply(ev("a", EventKind::Activity(Activity::Reading)));
+        let hint = FocusHint::Cwd("/repo".into());
+        assert!(matches_hint(&r.sessions["a"], &hint));
     }
 
     #[test]

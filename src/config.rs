@@ -34,6 +34,9 @@ pub struct Config {
     pub buttons: Vec<ConfigButton>,
     /// Master switch, so presence can be turned off without uninstalling hooks.
     pub enabled: bool,
+    /// With several sessions live, show the one in the terminal window you are looking
+    /// at. Turn off to always show the most recently active session instead.
+    pub follow_focus: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(15 * 60),
             buttons: Vec::new(),
             enabled: true,
+            follow_focus: true,
         }
     }
 }

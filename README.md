@@ -83,7 +83,7 @@ show_model = true
 # Always generic for these paths, whatever `detail` says
 hidden_paths = ["~/work/**", "~/clients/**"]
 
-# Your own Discord application, if you would rather not use the shared one
+# Your own Discord application, if you would rather not use the bundled one
 client_id = ""
 
 # Sessions silent this long are dropped (agents can die without saying goodbye)
@@ -91,6 +91,10 @@ idle_timeout = "15m"
 
 # Turn the card off without uninstalling the hooks
 enabled = true
+
+# With several sessions live, show the one in the focused terminal window.
+# Off = always show the most recently active session.
+follow_focus = true
 
 # Up to two link buttons on the card
 # [[buttons]]
@@ -120,9 +124,14 @@ enabled = true
 | waiting on a permission prompt | Waiting for approval |
 | done, awaiting input | Idle |
 
-Running several sessions at once? The card follows the most recently active one and
-appends `+2 more`. The elapsed timer spans your whole coding stretch, not just the
-newest session.
+Running several sessions at once? The card follows **the terminal window you are
+looking at**, and appends `+2 more` for the rest. Switch windows and the card switches
+with you. The elapsed timer spans your whole coding stretch, not just the newest session.
+
+Focus following is macOS-only for now (Ghostty, iTerm2 and Terminal.app) and needs the
+**Automation** permission macOS asks for the first time it queries your terminal. Deny
+it, set `follow_focus = false`, or run anywhere else, and the card falls back to the most
+recently active session.
 
 ## How it works
 
@@ -183,7 +192,8 @@ Rich Presence identifies itself with a Discord **Application ID**. This is a pub
 value, not a secret — there is no bot user, no OAuth and no token, because the
 connection is authenticated by the Discord desktop client you are already signed into.
 
-Set one up once:
+An application ID ships with the binary, so nothing here is required. Set up your own
+only if you want the card to carry your own name and artwork:
 
 1. Create an application at [discord.com/developers/applications](https://discord.com/developers/applications).
    Its name becomes the bold first line of the card.
@@ -204,6 +214,11 @@ the browser client has no IPC socket. Check that *Settings → Activity Privacy 
 current activity as a status message* is on.
 
 **Card is stuck.** `agent-presence stop`; it restarts with your next session.
+
+**Card does not follow the focused window.** macOS needs to have granted
+`agent-presence` Automation access to your terminal — check *System Settings → Privacy
+& Security → Automation*. Ghostty is matched by working directory rather than terminal
+device, so two sessions in the same repo can tie.
 
 **Hooks not firing.** Restart the agent after `install` — both read their hook config at
 startup.

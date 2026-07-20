@@ -151,6 +151,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 model: Some("claude-opus-4-8".into()),
                 target: Some("main.rs".into()),
+                tty: None,
                 started_unix: 1000,
                 started: now,
                 last_seen: now,

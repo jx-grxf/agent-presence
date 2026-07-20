@@ -5,6 +5,7 @@
 //! (roughly 5 updates per 20s). Hooks fire far faster than that during a busy turn, so
 //! updates are coalesced onto a tick instead of being sent one-per-event.
 
+pub mod focus;
 pub mod presence;
 pub mod registry;
 
@@ -23,6 +24,8 @@ const TICK: Duration = Duration::from_secs(2);
 /// How long to keep running with no sessions before exiting, so an idle machine does
 /// not carry a stray process forever.
 const SHUTDOWN_AFTER_IDLE: Duration = Duration::from_secs(90);
+/// Ceiling on the focused-window query, so a stalled terminal cannot stall the tick.
+const FOCUS_TIMEOUT: Duration = Duration::from_millis(800);
 
 pub async fn run() -> Result<()> {
     let _lock = SingleInstance::acquire()?;
@@ -78,8 +81,15 @@ pub async fn run() -> Result<()> {
             _ = ticker.tick() => {
                 registry.expire(config.idle_timeout);
 
+                // Only worth asking the window server when there is a choice to make.
+                let hint = if config.follow_focus && registry.has_multiple() {
+                    resolve_focus().await
+                } else {
+                    None
+                };
+
                 let desired = registry
-                    .snapshot()
+                    .snapshot_focused(hint.as_ref())
                     .filter(|_| config.enabled)
                     .map(|snap| presence::build(&snap, &config));
 
@@ -104,6 +114,23 @@ pub async fn run() -> Result<()> {
                 let _ = client.set_activity(None).await;
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Resolve the focused terminal off the event loop. The query shells out to
+/// `osascript`, which can hang on a wedged app, so it is capped well below the tick.
+async fn resolve_focus() -> Option<focus::FocusHint> {
+    let query = tokio::task::spawn_blocking(focus::focused_target);
+    match tokio::time::timeout(FOCUS_TIMEOUT, query).await {
+        Ok(Ok(hint)) => hint,
+        Ok(Err(e)) => {
+            tracing::debug!("focus query panicked: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("focus query timed out, keeping last-active session");
+            None
         }
     }
 }
