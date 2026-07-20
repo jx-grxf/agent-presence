@@ -1,0 +1,14 @@
+{
+  "name": "jx-grxf",
+  "owner": {
+    "name": "jx-grxf",
+    "url": "https://github.com/jx-grxf"
+  },
+  "plugins": [
+    {
+      "name": "agent-presence",
+      "source": "./plugin",
+      "description": "Discord Rich Presence for Claude Code — shows what your agent is doing on your Discord profile"
+    }
+  ]
+}

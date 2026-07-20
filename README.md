@@ -46,8 +46,19 @@ brew install jx-grxf/tap/agent-presence
 scoop bucket add jx-grxf https://github.com/jx-grxf/scoop-bucket
 scoop install agent-presence
 
+# Prebuilt binary (macOS arm64/x64, Linux x64, Windows x64)
+# https://github.com/jx-grxf/agent-presence/releases/latest
+
 # From source
 cargo install --git https://github.com/jx-grxf/agent-presence
+```
+
+Claude Code users can skip the hook wiring and take the plugin instead — the binary is
+still needed, see [`plugin/`](plugin/README.md):
+
+```
+/plugin marketplace add jx-grxf/agent-presence
+/plugin install agent-presence@jx-grxf
 ```
 
 Then wire it into whichever agents you have installed:

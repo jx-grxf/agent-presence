@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build, e.g. v0.1.0
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
+          # Cross-built on the same runner: the Apple SDK carries both arches, so this
+          # needs no extra toolchain and keeps Intel Macs on a supported runner image.
+          - { os: macos-latest, target: x86_64-apple-darwin, archive: tar.gz }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          stem="agent-presence-${tag}-${{ matrix.target }}"
+          mkdir -p dist "$stem"
+          cp README.md LICENSE "$stem/"
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/agent-presence.exe" "$stem/"
+            7z a -tzip "dist/${stem}.zip" "$stem" >/dev/null
+            asset="dist/${stem}.zip"
+          else
+            cp "target/${{ matrix.target }}/release/agent-presence" "$stem/"
+            tar czf "dist/${stem}.tar.gz" "$stem"
+            asset="dist/${stem}.tar.gz"
+          fi
+
+          # Homebrew and Scoop both verify the archive, so the digest ships with it.
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "$asset" | awk '{print $1}' > "${asset}.sha256"
+          else
+            sha256sum "$asset" | awk '{print $1}' > "${asset}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Render package manifests
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          packaging/render.sh "$tag" dist rendered
+
+      # Both taps live in their own repos, so this needs a token with write access to
+      # them. Without the secret the release still publishes; only the taps go stale.
+      - name: Update Homebrew tap
+        if: env.PACKAGES_TOKEN != ''
+        run: |
+          packaging/publish.sh \
+            "https://x-access-token:${PACKAGES_TOKEN}@github.com/jx-grxf/homebrew-tap.git" \
+            rendered/agent-presence.rb Formula/agent-presence.rb \
+            "${{ github.event.inputs.tag || github.ref_name }}"
+
+      - name: Update Scoop bucket
+        if: env.PACKAGES_TOKEN != ''
+        run: |
+          packaging/publish.sh \
+            "https://x-access-token:${PACKAGES_TOKEN}@github.com/jx-grxf/scoop-bucket.git" \
+            rendered/agent-presence.json bucket/agent-presence.json \
+            "${{ github.event.inputs.tag || github.ref_name }}"

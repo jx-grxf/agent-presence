@@ -1,0 +1,40 @@
+class AgentPresence < Formula
+  desc "Discord Rich Presence for Claude Code and Codex"
+  homepage "https://github.com/jx-grxf/agent-presence"
+  version "@@VERSION@@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "@@URL_MACOS_ARM@@"
+      sha256 "@@SHA_MACOS_ARM@@"
+    end
+    on_intel do
+      url "@@URL_MACOS_X64@@"
+      sha256 "@@SHA_MACOS_X64@@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "@@URL_LINUX_X64@@"
+      sha256 "@@SHA_LINUX_X64@@"
+    end
+  end
+
+  def install
+    bin.install "agent-presence"
+  end
+
+  def caveats
+    <<~EOS
+      Wire it into the agents you have installed:
+        agent-presence install
+        agent-presence doctor
+    EOS
+  end
+
+  test do
+    assert_match "agent-presence", shell_output("#{bin}/agent-presence --version")
+  end
+end
