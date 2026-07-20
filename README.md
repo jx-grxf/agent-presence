@@ -177,17 +177,25 @@ If Discord is closed, the daemon keeps running and reconnects when it comes back
 Logs: `~/.config/agent-presence/agent-presence.log`. Raise the level with
 `AGENT_PRESENCE_LOG=agent_presence=debug`.
 
-## Using your own Discord application
+## Discord application
 
-The shared Application ID works out of the box. If you want the card to carry your own
-name and artwork:
+Rich Presence identifies itself with a Discord **Application ID**. This is a public
+value, not a secret — there is no bot user, no OAuth and no token, because the
+connection is authenticated by the Discord desktop client you are already signed into.
+
+Set one up once:
 
 1. Create an application at [discord.com/developers/applications](https://discord.com/developers/applications).
-   The name becomes the bold first line of the card.
-2. Under **Rich Presence → Art Assets**, upload images keyed `claude` and `codex`.
-3. Put the Application ID into `client_id` in your config.
+   Its name becomes the bold first line of the card.
+2. Under **Rich Presence → Art Assets**, upload two images keyed exactly `claude`
+   and `codex`.
+3. Copy the Application ID into your config:
 
-No bot user, no OAuth, no token.
+```toml
+client_id = "1234567890123456789"
+```
+
+Or export `AGENT_PRESENCE_CLIENT_ID` for a quick test without editing the config.
 
 ## Troubleshooting
 
