@@ -5,7 +5,6 @@
 //! we probe them in order and keep the first that completes a connect.
 
 use anyhow::{bail, Result};
-use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Transport {
@@ -74,7 +73,9 @@ impl Transport {
 /// Directories that may hold the socket. Plain macOS uses `$TMPDIR`; the Linux
 /// entries cover Flatpak and Snap installs, which nest the socket a level deeper.
 #[cfg(unix)]
-fn candidate_dirs() -> Vec<PathBuf> {
+fn candidate_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
     let mut bases: Vec<PathBuf> = ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"]
         .iter()
         .filter_map(std::env::var_os)
