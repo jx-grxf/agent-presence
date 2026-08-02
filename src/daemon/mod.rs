@@ -67,6 +67,15 @@ pub async fn run() -> Result<()> {
 
     tracing::info!("daemon listening on {}", socket.display());
 
+    if config.update_check {
+        // Off the event loop and off the critical path: curl can sit on a DNS timeout
+        // for seconds, and a presence tick must not wait behind it. The result only
+        // lands in a cache file that `status` and `doctor` read later.
+        tokio::spawn(async {
+            let _ = tokio::task::spawn_blocking(crate::update::refresh_if_stale).await;
+        });
+    }
+
     let mut client = DiscordClient::new(config.effective_client_id());
     let mut registry = Registry::default();
     let mut ticker = tokio::time::interval(TICK);
@@ -165,17 +174,86 @@ impl SingleInstance {
         let path = config::config_dir().join("daemon.pid");
         std::fs::create_dir_all(path.parent().unwrap()).ok();
 
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            if let Ok(pid) = existing.trim().parse::<u32>() {
-                if pid != std::process::id() && process_alive(pid) {
-                    anyhow::bail!("daemon already running with pid {pid}");
+        // Created with O_EXCL rather than read-then-write: any hook event may now spawn
+        // a daemon, so two of them racing on the same lock is an ordinary occurrence
+        // and the loser has to lose reliably. Otherwise both would bind the control
+        // socket, and `Listener::bind` unlinks whatever it finds — the second daemon
+        // would silently steal every event from the first.
+        //
+        // Two attempts: the first can legitimately lose to a *stale* file left by a
+        // daemon that was killed before its `Drop` ran.
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(std::process::id().to_string().as_bytes())
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    return Ok(Self { path });
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    match holder {
+                        Some(pid) if pid != std::process::id() && process_alive(pid) => {
+                            anyhow::bail!("daemon already running with pid {pid}")
+                        }
+                        _ => {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("claiming {}", path.display())),
             }
         }
-        std::fs::write(&path, std::process::id().to_string())
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(Self { path })
+        anyhow::bail!("could not claim {}", path.display())
     }
+}
+
+/// Launch `exe daemon` fully detached, so it outlives whatever started it.
+///
+/// Shared by the hook (which starts a daemon when none is listening) and `update`
+/// (which has to bring one back after replacing the binary underneath it).
+pub fn spawn_detached(exe: &std::path::Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        // New session, so closing the terminal does not SIGHUP the daemon.
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawning {}", exe.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn setsid() -> i32;
 }
 
 impl Drop for SingleInstance {

@@ -4,6 +4,26 @@ The section matching the tag being built becomes the body of the GitHub release.
 Add a new `## vX.Y.Z` heading before tagging; a tag with no section here still
 releases, it just carries the generated changelog alone.
 
+## v0.2.3
+
+**`agent-presence update`.** It works out what installed the binary — Homebrew, Scoop,
+`cargo install`, or a file you placed yourself — runs that manager's own upgrade, and
+restarts the daemon on the new build. Nothing self-overwrites: a Homebrew binary that
+replaced itself would leave the Cellar disagreeing with its receipt and break every
+later `brew upgrade`. `--check` reports what is available without installing anything.
+
+**The card comes back on its own now.** A daemon that died mid-session — a crash,
+`agent-presence stop`, or a package upgrade replacing the binary underneath it — stayed
+dead until you happened to open a new agent session, because only `SessionStart` was
+allowed to start one. Any hook event can now, so the gap closes on your next tool call.
+A five-second cooldown and an O_EXCL lock on the pid file keep a burst of events from
+spawning more than one.
+
+**Optional update check.** With `update_check = true` (the default) the daemon asks
+GitHub once a day and caches the answer, so `status` and `doctor` can mention a newer
+release without going to the network themselves. It only ever reports — installing stays
+a command you run.
+
 ## v0.2.2
 
 **`detail = "full"` no longer publishes anything it has not reduced first.** It used to

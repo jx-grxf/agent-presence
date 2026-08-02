@@ -43,6 +43,10 @@ pub struct Config {
     /// With several sessions live, show the one in the terminal window you are looking
     /// at. Turn off to always show the most recently active session instead.
     pub follow_focus: bool,
+    /// Let the daemon ask GitHub once a day whether a newer release exists, so `status`
+    /// and `doctor` can say so. Nothing is ever installed without `agent-presence
+    /// update` being run by hand.
+    pub update_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,7 @@ impl Default for Config {
             buttons: Vec::new(),
             enabled: true,
             follow_focus: true,
+            update_check: true,
         }
     }
 }

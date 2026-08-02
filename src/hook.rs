@@ -40,22 +40,48 @@ async fn try_run(agent: Agent) -> Result<()> {
 
     match tokio::time::timeout(deadline, ipc::send_event(&socket, &event)).await {
         Ok(Ok(())) => Ok(()),
-        // No daemon listening. Start one — but only for SessionStart, so a burst of
-        // tool events can never spawn a pile of daemons racing for the same lock.
+        // No daemon listening. Any event may start one: a daemon can die in the middle
+        // of a session — a crash, `agent-presence stop`, a package upgrade replacing the
+        // binary underneath it — and restricting the restart to SessionStart left the
+        // card dark until the user happened to open a new session. The cooldown below
+        // takes over the job that restriction was doing, which was stopping a burst of
+        // tool events from spawning a pile of daemons.
         Ok(Err(e)) => {
-            if event.kind == EventKind::SessionStart {
-                spawn_daemon()?;
-                // Give it a moment to bind, then deliver the event that started it,
-                // otherwise the session would stay invisible until the next tool call.
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                let _ = tokio::time::timeout(deadline, ipc::send_event(&socket, &event)).await;
-                Ok(())
-            } else {
-                Err(e)
+            if !claim_spawn_slot() {
+                return Err(e);
             }
+            crate::daemon::spawn_detached(&std::env::current_exe()?)?;
+            // Give it a moment to bind, then deliver the event that started it,
+            // otherwise this activity would stay invisible until the next tool call.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            let _ = tokio::time::timeout(deadline, ipc::send_event(&socket, &event)).await;
+            Ok(())
         }
         Err(_) => anyhow::bail!("daemon did not accept the event within {deadline:?}"),
     }
+}
+
+/// Minimum spacing between two spawn attempts. Long enough that a burst of tool events
+/// produces one daemon, short enough that a crash is invisible to the user.
+const SPAWN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether this hook is the one allowed to start a daemon right now.
+///
+/// The file's mtime is the whole state. Losing the race here is harmless — the PID lock
+/// in the daemon is what actually guarantees a single instance — so this only has to be
+/// good enough to keep a busy turn from forking a hundred processes that all lose it.
+fn claim_spawn_slot() -> bool {
+    let path = config::config_dir().join("daemon.spawn");
+    let recently_tried = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|when| when.elapsed().ok())
+        .is_some_and(|since| since < SPAWN_COOLDOWN);
+    if recently_tried {
+        return false;
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).ok();
+    std::fs::write(&path, b"").is_ok()
 }
 
 /// Path of this process's controlling terminal, e.g. `/dev/ttys004`.
@@ -88,44 +114,4 @@ fn controlling_tty() -> Option<String> {
 #[cfg(unix)]
 extern "C" {
     fn ttyname(fd: i32) -> *const std::os::raw::c_char;
-}
-
-/// Launch the daemon fully detached, so it outlives this hook and the agent session.
-fn spawn_daemon() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(unix)]
-    {
-        // New session, so closing the terminal does not SIGHUP the daemon.
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc_setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
-
-    cmd.spawn()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "setsid"]
-    fn libc_setsid() -> i32;
 }

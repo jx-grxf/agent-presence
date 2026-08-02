@@ -8,6 +8,7 @@ mod ipc;
 mod onboarding;
 mod tui;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -56,6 +57,12 @@ enum Command {
     Doctor,
     /// Stop a running daemon.
     Stop,
+    /// Upgrade to the newest release through whatever installed this binary.
+    Update {
+        /// Report what is available and exit, without installing anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Send a one-off activity, to verify the Discord IPC layer.
     DebugActivity {
         #[arg(long, default_value = "Claude Code")]
@@ -87,7 +94,8 @@ async fn main() -> Result<()> {
         Command::Config => tui::run()?,
         Command::Status => status()?,
         Command::Doctor => doctor().await?,
-        Command::Stop => stop()?,
+        Command::Stop => stop(),
+        Command::Update { check } => update::run(check)?,
         Command::DebugActivity {
             details,
             state,
@@ -149,6 +157,7 @@ fn status() -> Result<()> {
             &ui::dim("not running — starts with your next session"),
         ),
     }
+    report_update(&config);
 
     ui::heading("Settings");
     ui::field("detail", &format!("{:?}", config.detail).to_lowercase());
@@ -181,6 +190,22 @@ fn status() -> Result<()> {
         ui::dim("  Change any of this with `agent-presence config`.")
     );
     Ok(())
+}
+
+/// One line about a newer release, from the daemon's cached check.
+///
+/// Never reaches the network: `status` and `doctor` have to stay instant, and a machine
+/// with no connectivity must not sit here waiting for a timeout.
+fn report_update(config: &config::Config) {
+    if !config.update_check {
+        return;
+    }
+    if let Some(latest) = update::available() {
+        ui::warn(&format!(
+            "v{latest} available {}",
+            ui::dim("— run `agent-presence update`")
+        ));
+    }
 }
 
 async fn doctor() -> Result<()> {
@@ -236,8 +261,10 @@ async fn doctor() -> Result<()> {
     ui::heading("Daemon");
     match daemon::running_pid() {
         Some(pid) => ui::ok(&format!("running {}", ui::dim(&format!("pid {pid}")))),
-        None => ui::warn("not running — it starts itself with your next session"),
+        None => ui::warn("not running — it starts itself with your next tool call"),
     }
+    ui::field("version", update::current());
+    report_update(&config);
 
     ui::heading("Card preview");
     let (details, state) = tui::preview_card(&config);
@@ -259,24 +286,28 @@ async fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn stop() -> Result<()> {
-    match daemon::running_pid() {
-        Some(pid) => {
-            #[cfg(unix)]
-            unsafe {
-                terminate(pid as i32, 15);
-            }
-            #[cfg(windows)]
-            {
-                std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string()])
-                    .output()?;
-            }
-            println!("stopped daemon (pid {pid})");
-        }
+fn stop() {
+    match stop_daemon() {
+        Some(pid) => println!("stopped daemon (pid {pid})"),
         None => println!("no daemon running"),
     }
-    Ok(())
+}
+
+/// Terminate a running daemon, returning the pid it had. Also used by `update`, which
+/// has to take the old binary out of the way before starting the new one.
+pub fn stop_daemon() -> Option<u32> {
+    let pid = daemon::running_pid()?;
+    #[cfg(unix)]
+    unsafe {
+        terminate(pid as i32, 15);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output();
+    }
+    Some(pid)
 }
 
 #[cfg(unix)]

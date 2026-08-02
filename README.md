@@ -97,6 +97,34 @@ To remove it completely:
 agent-presence install --uninstall
 ```
 
+## Updating
+
+```bash
+agent-presence update
+```
+
+It works out what installed the binary — Homebrew, Scoop, `cargo install`, or a file you
+put there yourself — runs that manager's own upgrade, and restarts the daemon on the new
+build. Nothing self-overwrites: a Homebrew binary that replaced itself would leave the
+Cellar disagreeing with the receipt and break every later `brew upgrade`. A standalone
+install is the one case nothing can do for you, and it says so rather than guessing.
+
+The restart is the part worth having. A running daemon holds the *old* binary open, so
+without it the card stays dark until you happen to open a new agent session.
+
+`agent-presence update --check` reports what is available and installs nothing. The
+daemon also asks GitHub once a day on its own and caches the answer, so `status` and
+`doctor` can mention a new release without ever going to the network themselves:
+
+```
+Daemon
+  ✓ running (pid 4821)
+  ! v0.2.3 available — run `agent-presence update`
+```
+
+That check is the only thing `update_check` controls. Nothing installs itself.
+Set `update_check = false` to switch it off.
+
 ## Privacy
 
 The default card shows **no repository name, no branch, and no file names**. It says
@@ -146,6 +174,10 @@ enabled = true
 # With several sessions live, show the one in the focused terminal window.
 # Off = always show the most recently active session.
 follow_focus = true
+
+# Let the daemon ask GitHub once a day whether a newer release exists.
+# It only reports; installing stays a manual `agent-presence update`.
+update_check = true
 
 # Up to two link buttons on the card
 # [[buttons]]
@@ -247,6 +279,8 @@ If Discord is closed, the daemon keeps running and reconnects when it comes back
 | `agent-presence config` | Edit settings in a menu, with a live card preview |
 | `agent-presence status` | Daemon, config and Application ID |
 | `agent-presence doctor` | Diagnose a card that is not appearing |
+| `agent-presence update` | Upgrade through whatever installed the binary |
+| `agent-presence update --check` | Report what is available, install nothing |
 | `agent-presence stop` | Stop the daemon |
 | `agent-presence debug-activity` | Push a test card, to check the Discord link |
 
@@ -280,7 +314,7 @@ Or export `AGENT_PRESENCE_CLIENT_ID` for a quick test without editing the config
 the browser client has no IPC socket. Check that *Settings → Activity Privacy → Display
 current activity as a status message* is on.
 
-**Card is stuck.** `agent-presence stop`; it restarts with your next session.
+**Card is stuck.** `agent-presence stop`; the next tool call starts a fresh daemon.
 
 **Card does not follow the focused window.** macOS needs to have granted
 `agent-presence` Automation access to your terminal — check *System Settings → Privacy

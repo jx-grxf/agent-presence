@@ -29,17 +29,19 @@ enum Field {
     ShowModel,
     FollowFocus,
     Enabled,
+    UpdateCheck,
     IdleTimeout,
     HiddenPaths,
     ClientId,
 }
 
 impl Field {
-    const ALL: [Field; 7] = [
+    const ALL: [Field; 8] = [
         Field::Detail,
         Field::ShowModel,
         Field::FollowFocus,
         Field::Enabled,
+        Field::UpdateCheck,
         Field::IdleTimeout,
         Field::HiddenPaths,
         Field::ClientId,
@@ -51,6 +53,7 @@ impl Field {
             Field::ShowModel => "Show model",
             Field::FollowFocus => "Follow focus",
             Field::Enabled => "Enabled",
+            Field::UpdateCheck => "Update check",
             Field::IdleTimeout => "Idle timeout",
             Field::HiddenPaths => "Hidden paths",
             Field::ClientId => "Application ID",
@@ -63,6 +66,7 @@ impl Field {
             Field::ShowModel => "Append the model name, e.g. \"· Opus 4.8\".",
             Field::FollowFocus => "Show the session in the focused terminal window (macOS).",
             Field::Enabled => "Master switch. Off keeps the hooks installed but clears the card.",
+            Field::UpdateCheck => "Ask GitHub once a day whether a newer release exists.",
             Field::IdleTimeout => "Drop sessions silent this long. Accepts 30s, 15m, 2h.",
             Field::HiddenPaths => "Globs always forced to generic. One per line, ~ expands.",
             Field::ClientId => "Your own Discord application. Empty uses the bundled one.",
@@ -240,6 +244,8 @@ fn toggle(config: &mut Config, field: Field, backwards: bool) {
         Field::ShowModel => config.show_model = !config.show_model,
         Field::FollowFocus => config.follow_focus = !config.follow_focus,
         Field::Enabled => config.enabled = !config.enabled,
+        Field::UpdateCheck => config.update_check = !config.update_check,
+        // The text fields, which Enter opens an editor for instead.
         _ => {}
     }
 }
@@ -307,6 +313,7 @@ fn value_of(config: &Config, field: Field) -> String {
         .to_string(),
         Field::ShowModel => onoff(config.show_model),
         Field::FollowFocus => onoff(config.follow_focus),
+        Field::UpdateCheck => onoff(config.update_check),
         Field::Enabled => onoff(config.enabled),
         Field::IdleTimeout => humanize(config.idle_timeout),
         Field::HiddenPaths => {
