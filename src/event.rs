@@ -166,11 +166,21 @@ fn classify_tool(tool_name: &str) -> Activity {
 }
 
 /// Pull a short human-readable target out of the tool input.
+///
+/// Every branch is an allowlist, and deliberately so. Tool inputs carry arbitrary
+/// secrets — an API key in `STRIPE_KEY=… deploy`, credentials inside a
+/// `postgres://user:pass@host` string, a client's name in an absolute path — and
+/// whatever comes back here is published to Discord verbatim at `detail = "full"`.
+/// So each branch reduces its input to a shape that *cannot* carry a secret instead
+/// of trying to recognize secrets in free-form text, which never holds up.
 fn extract_target(tool_name: &str, input: &serde_json::Value) -> Option<String> {
-    let raw = match tool_name {
-        "Bash" | "shell" | "local_shell" => input["command"].as_str()?.lines().next()?.to_string(),
-        "WebSearch" | "web_search" => input["query"].as_str()?.to_string(),
-        "WebFetch" => input["url"].as_str()?.to_string(),
+    let label = match tool_name {
+        "Bash" | "shell" | "local_shell" => command_label(input["command"].as_str()?)?,
+        "WebFetch" => host_of(input["url"].as_str()?)?,
+        // A search query is prose the user never meant to publish, and it has no safe
+        // reduction — there is no "harmless part" of it. The card just says
+        // "Researching".
+        "WebSearch" | "web_search" => return None,
         _ => {
             let path = input["file_path"]
                 .as_str()
@@ -183,8 +193,60 @@ fn extract_target(tool_name: &str, input: &serde_json::Value) -> Option<String> 
                 .into_owned()
         }
     };
-    let raw = raw.trim();
-    (!raw.is_empty()).then(|| raw.chars().take(60).collect())
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.chars().take(60).collect())
+}
+
+/// `git push origin main 2>&1 | tail -3` → `git push`.
+///
+/// Only the program and, when it is a plain word, its subcommand survive. Arguments are
+/// dropped wholesale: they are where the tokens, hosts, paths and connection strings
+/// live, and `git push` is what is worth reading on the card anyway.
+fn command_label(command: &str) -> Option<String> {
+    let mut words = command
+        .lines()
+        .next()?
+        .split_whitespace()
+        // Leading `KEY=value` assignments are a common way to hand a secret to a single
+        // command. Step over them to reach the program itself.
+        .skip_while(|w| w.contains('='));
+
+    // Through `file_name`, so `./scripts/deploy.sh` cannot carry the directories above it.
+    let program = plain_word(std::path::Path::new(words.next()?).file_name()?.to_str()?)?;
+    Some(match words.next().and_then(plain_word) {
+        Some(subcommand) => format!("{program} {subcommand}"),
+        None => program.to_string(),
+    })
+}
+
+/// A bare word: letters, digits, `.`, `-`, `_`. Anything else — a path, a flag, a URL, an
+/// assignment, a shell operator, a redirect — is not something we are willing to publish.
+fn plain_word(word: &str) -> Option<&str> {
+    let plain = !word.is_empty()
+        && word.len() <= 24
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    plain.then_some(word)
+}
+
+/// `https://user:tok@api.example.com:8443/v1/x?key=…` → `api.example.com`.
+///
+/// The path and query are where one-time tokens and presigned signatures live, and the
+/// userinfo is credentials outright, so only the host survives.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+
+    let plain = !host.is_empty()
+        && host.len() <= 40
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+    plain.then(|| host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -225,6 +287,68 @@ mod tests {
             Some("cargo test"),
             "only the first line"
         );
+    }
+
+    /// Everything below is a thing that used to reach Discord verbatim. The assertion
+    /// that matters in each case is the `!contains` one — the exact surviving label is
+    /// cosmetic, the absence of the secret is not.
+    #[test]
+    fn command_labels_drop_every_argument() {
+        let cases = [
+            ("git push origin main 2>&1 | tail -3", Some("git push")),
+            ("cargo test --all-features", Some("cargo test")),
+            ("npm run build", Some("npm run")),
+            // The leak vectors.
+            ("STRIPE_KEY=sk_live_9f2 ./deploy.sh", Some("deploy.sh")),
+            (
+                "curl -H \"Authorization: Bearer tok_x\" https://api.acme.io",
+                Some("curl"),
+            ),
+            ("cat /Users/me/clients/acme/.env", Some("cat")),
+            (
+                "psql postgres://admin:hunter2@prod-db.internal/app",
+                Some("psql"),
+            ),
+            ("ssh deploy@10.13.7.2", Some("ssh")),
+            ("gh api /repos/acme-corp/private-thing", Some("gh api")),
+            // Nothing publishable left once the assignment is stepped over.
+            ("AWS_SECRET_ACCESS_KEY=wJalr", None),
+            // Not a plain program name, so we decline rather than guess.
+            ("(cd ~/clients/acme && make)", None),
+        ];
+        for (command, expected) in cases {
+            let label = command_label(command);
+            assert_eq!(label.as_deref(), expected, "command: {command}");
+            if let Some(label) = &label {
+                let leaked = [
+                    "sk_live", "tok_x", "hunter2", "acme", "10.13", "wJalr", "clients",
+                ]
+                .into_iter()
+                .find(|secret| label.contains(secret));
+                assert_eq!(leaked, None, "leaked from: {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn web_fetch_keeps_only_the_host() {
+        assert_eq!(
+            host_of("https://user:tok_x@api.example.com:8443/v1/keys?token=abc#f").as_deref(),
+            Some("api.example.com"),
+        );
+        assert_eq!(host_of("http://LOCALHOST/x").as_deref(), Some("localhost"));
+        assert_eq!(host_of("not a url").as_deref(), None);
+    }
+
+    #[test]
+    fn web_search_query_is_never_published() {
+        let e = parse(
+            Agent::Claude,
+            r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"WebSearch",
+                "tool_input":{"query":"how to fix the acme corp payroll bug"}}"#,
+        );
+        assert_eq!(e.kind, EventKind::Activity(Activity::Researching));
+        assert_eq!(e.target, None);
     }
 
     #[test]

@@ -345,7 +345,7 @@ fn privacy(wizard: &Wizard) -> Vec<Line<'static>> {
         ),
         Detail::Full => (
             "full",
-            "Adds the file or command being worked on right now.",
+            "Adds the file name, or the command without its arguments.",
         ),
     };
     let leaks = wizard.config.detail != Detail::Generic;

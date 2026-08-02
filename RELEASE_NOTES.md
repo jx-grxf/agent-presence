@@ -4,6 +4,23 @@ The section matching the tag being built becomes the body of the GitHub release.
 Add a new `## vX.Y.Z` heading before tagging; a tag with no section here still
 releases, it just carries the generated changelog alone.
 
+## v0.2.2
+
+**`detail = "full"` no longer publishes anything it has not reduced first.** It used to
+send the first line of every shell command to Discord as typed, which meant an API key in
+`STRIPE_KEY=… ./deploy.sh`, a bearer token in a `curl -H` flag, or the credentials inside
+a `postgres://user:pass@host` string went out to anyone who could see your profile. Web
+fetches sent the full URL including its query string, and web searches sent the query.
+
+Now every field is reduced to a shape that cannot carry a secret. A command keeps its
+program and subcommand and nothing else — `git push origin main 2>&1 | tail -3` becomes
+`git push`, and `STRIPE_KEY=… ./deploy.sh` becomes `deploy.sh`. A URL keeps only its
+host. A search query is not sent at all. This is an allowlist rather than a scan for
+secret-looking text, because the scan is the approach that always has one more hole in it.
+
+If you run at `detail = "full"`, upgrading is worth doing now. `generic` and `project`
+were never affected — neither one sends the command in the first place.
+
 ## v0.2.1
 
 **Setup now walks you through it.** Running `agent-presence` with no arguments opens a

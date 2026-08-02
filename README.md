@@ -162,6 +162,21 @@ follow_focus = true
 `hidden_paths` always wins. A repo matching it falls back to `generic` even at
 `detail = "full"`.
 
+`full` never publishes free-form text. It reduces whatever the agent is doing to a
+shape that cannot carry a secret:
+
+| Agent runs | Card says |
+|---|---|
+| `git push origin main 2>&1 \| tail -3` | `Running commands: git push` |
+| `STRIPE_KEY=sk_live_9f2 ./deploy.sh` | `Running commands: deploy.sh` |
+| `curl -H "Authorization: Bearer …" https://api.acme.io` | `Running commands: curl` |
+| `Edit /Users/you/clients/acme/billing.rs` | `Editing code: billing.rs` |
+| a web fetch of `https://api.acme.io/v1?token=…` | `Researching: api.acme.io` |
+| a web search | `Researching` — the query is never sent |
+
+Command arguments are dropped wholesale, because that is where keys, hosts, paths and
+connection strings live. Paths keep only their file name, URLs only their host.
+
 ## What gets shown
 
 | Agent is… | Card says |
