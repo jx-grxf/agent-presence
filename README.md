@@ -26,6 +26,11 @@ Show what your coding agent is doing — live on your Discord profile.
 
 A single static binary. No Node, no Python, no bot token.
 
+<!-- DEMO: add a screen recording here — screen recording of the Discord profile updating live while Claude Code works
+     Record with ⌘⇧5, then: jx-grxf/tools/make-demo.sh <recording.mov> .
+<p align="center"><img src=".github/assets/demo.gif" alt="" width="720"></p>
+-->
+
 ## Why another one?
 
 Existing Discord presence tools for Claude Code are Node or Python scripts that only
