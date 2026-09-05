@@ -24,11 +24,36 @@ const LATEST_RELEASE_URL: &str = "https://github.com/jx-grxf/agent-presence/rele
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Ceiling on the network call, so neither the daemon nor `update` can hang on it.
 const NETWORK_TIMEOUT: &str = "8";
+/// How long a stopping daemon gets to release its lock before we give up on restarting
+/// it. Generous, because clearing the card can wait on a Discord socket that never
+/// answers — and giving up is cheap, since the next hook event starts one anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 pub fn current() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// The hand-written release notes, compiled in.
+///
+/// Baked into the binary rather than fetched, so "what's new" works offline and costs no
+/// GitHub API budget — the daily check deliberately reads only a redirect target, and
+/// asking for a release *body* would mean the rate-limited API instead. The trade is that
+/// this describes the version you are running, not the one you could upgrade to, which is
+/// the more useful of the two anyway: it explains what just changed under you.
+const NOTES: &str = include_str!("../RELEASE_NOTES.md");
+
+/// The notes section for one version, or `None` when it has none.
+pub fn notes_for(version: &str) -> Option<&'static str> {
+    let heading = format!("## v{version}");
+    let rest = NOTES.split_once(&heading)?.1;
+    let body = match rest.find("\n## ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    let body = body.trim();
+    (!body.is_empty()).then_some(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +250,46 @@ pub fn refresh_if_stale() {
     }
 }
 
+/// Install a newer release without being asked, if the user opted in.
+///
+/// Called from the daemon's idle path, which is the only safe moment: replacing the
+/// binary while a turn is in flight means the next hook execs a file the package manager
+/// has already deleted. It delegates to the package manager exactly as `update` does —
+/// nothing self-overwrites — and a standalone install has no manager, so it is skipped
+/// with a log line rather than guessed at.
+pub fn auto_install_if_available() {
+    let Some(latest) = available() else {
+        return;
+    };
+    let install = Install::detect();
+    let Some(steps) = install.upgrade_steps() else {
+        tracing::info!(
+            "v{latest} is available, but nothing owns this binary — run `agent-presence update`"
+        );
+        return;
+    };
+
+    tracing::info!("auto-updating to v{latest} via {}", install.label());
+    for step in &steps {
+        let shown = step.join(" ");
+        match Command::new(&step[0]).args(&step[1..]).output() {
+            Ok(out) if out.status.success() => tracing::info!("ran `{shown}`"),
+            Ok(out) => {
+                tracing::warn!(
+                    "auto-update stopped: `{shown}` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("auto-update stopped: could not run `{shown}`: {e}");
+                return;
+            }
+        }
+    }
+    tracing::info!("auto-update done; exiting so the next event starts the new binary");
+}
+
 fn write_cache(latest: &str) -> Result<()> {
     let path = cache_path();
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -315,7 +380,18 @@ pub fn run(check_only: bool) -> Result<()> {
 fn restart_daemon() {
     // Nothing was running, so there is nothing to bring back — the next hook event
     // starts one on its own.
-    if crate::stop_daemon().is_none() {
+    let Some(pid) = crate::stop_daemon() else {
+        return;
+    };
+
+    // Signalling is not stopping. The old daemon still has to clear the Discord card
+    // before it releases the single-instance lock, and that is a round trip to a socket
+    // that may not answer for seconds. Starting the replacement first meant it lost the
+    // lock and exited immediately — while this function reported a successful restart.
+    if !crate::daemon::await_exit(pid, SHUTDOWN_GRACE) {
+        ui::warn(&format!(
+            "daemon {pid} did not stop within {SHUTDOWN_GRACE:?} — the next tool call will restart it"
+        ));
         return;
     }
 
@@ -412,6 +488,31 @@ mod tests {
             Install::Standalone(loose.to_path_buf()),
             "an unowned binary has no manager to delegate to"
         );
+    }
+
+    #[test]
+    fn this_release_ships_its_own_notes() {
+        // The editor shows these, and the release workflow publishes them. Tagging a
+        // version whose notes were never written produces an empty panel and an empty
+        // GitHub release, and nothing else would catch it.
+        let notes = notes_for(current())
+            .unwrap_or_else(|| panic!("RELEASE_NOTES.md has no `## v{}` section", current()));
+        assert!(
+            notes.len() > 40,
+            "the notes for {} are too thin to be real: {notes:?}",
+            current()
+        );
+    }
+
+    #[test]
+    fn notes_stop_at_the_next_version() {
+        let notes = notes_for("0.2.3").expect("0.2.3 section");
+        assert!(notes.contains("agent-presence update"));
+        assert!(
+            !notes.contains("## v0.2.2"),
+            "a section must not swallow the one below it"
+        );
+        assert_eq!(notes_for("9.9.9"), None);
     }
 
     #[test]

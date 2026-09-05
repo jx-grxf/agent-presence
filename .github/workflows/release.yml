@@ -61,9 +61,9 @@ jobs:
 
           # Homebrew and Scoop both verify the archive, so the digest ships with it.
           if command -v shasum >/dev/null; then
-            shasum -a 256 "$asset" | awk '{print $1}' > "${asset}.sha256"
+            (cd dist && shasum -a 256 "${asset#dist/}") > "${asset}.sha256"
           else
-            sha256sum "$asset" | awk '{print $1}' > "${asset}.sha256"
+            (cd dist && sha256sum "${asset#dist/}") > "${asset}.sha256"
           fi
 
       - uses: actions/upload-artifact@v4

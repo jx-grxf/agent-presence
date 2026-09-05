@@ -30,9 +30,22 @@ pub struct Snapshot {
     pub oldest_start_unix: u64,
 }
 
+/// How much fresher a rival has to be before it takes the card away from the session
+/// currently on it.
+///
+/// Without this the card simply showed whichever session fired most recently, and four
+/// concurrent sessions all firing tool events traded the lead several times a minute —
+/// the card flipped between projects, agents and icons on every tick. Real work produces
+/// an event every few seconds, so a session that has been quiet this long has genuinely
+/// stopped, while two busy sessions stay within the margin of each other forever and the
+/// incumbent keeps the card.
+const SWITCH_MARGIN: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 pub struct Registry {
     sessions: HashMap<String, Session>,
+    /// Session the card is currently describing, so the choice is stable across ticks.
+    primary: Option<String>,
 }
 
 impl Registry {
@@ -41,6 +54,9 @@ impl Registry {
         match event.kind {
             EventKind::SessionEnd => {
                 self.sessions.remove(&event.session_id);
+                if self.primary.as_deref() == Some(event.session_id.as_str()) {
+                    self.primary = None;
+                }
             }
             EventKind::Ignored => {
                 // Still counts as a sign of life.
@@ -84,6 +100,28 @@ impl Registry {
         }
     }
 
+    /// Everything the daemon is tracking, for `agent-presence sessions` and the settings
+    /// editor. Ordered with the session on the card first, then by how recently each was
+    /// active, so the list reads the same way every time it is printed.
+    pub fn describe(&self) -> Vec<crate::ipc::SessionInfo> {
+        let now = Instant::now();
+        let mut out: Vec<crate::ipc::SessionInfo> = self
+            .sessions
+            .iter()
+            .map(|(id, s)| crate::ipc::SessionInfo {
+                agent: s.agent,
+                activity: s.activity,
+                cwd: s.cwd.clone(),
+                model: s.model.clone(),
+                quiet_secs: now.duration_since(s.last_seen).as_secs(),
+                age_secs: now.duration_since(s.started).as_secs(),
+                on_card: self.primary.as_deref() == Some(id.as_str()),
+            })
+            .collect();
+        out.sort_by_key(|s| (!s.on_card, s.quiet_secs));
+        out
+    }
+
     /// Drop sessions whose agent died without firing `SessionEnd`.
     pub fn expire(&mut self, idle_timeout: Duration) -> usize {
         let now = Instant::now();
@@ -108,32 +146,23 @@ impl Registry {
     }
 
     #[cfg(test)]
-    pub fn snapshot(&self) -> Option<Snapshot> {
+    pub fn snapshot(&mut self) -> Option<Snapshot> {
         self.snapshot_focused(None)
     }
 
-    /// Pick the session the card describes. The focused terminal wins when we can
-    /// identify it; otherwise the most recently active session does, which is also the
-    /// fallback when the focused window holds no agent session at all.
-    pub fn snapshot_focused(&self, hint: Option<&FocusHint>) -> Option<Snapshot> {
-        let focused = hint.and_then(|h| {
-            self.sessions
-                .values()
-                .filter(|s| matches_hint(s, h))
-                // Several sessions can share one cwd; the busier one is the better guess.
-                .max_by_key(|s| (s.last_seen, s.started))
-        });
+    /// Pick the session the card describes.
+    ///
+    /// Three rules, in order. The focused terminal wins outright — that is the user
+    /// pointing at a window, and obeying it instantly is the whole point of the feature.
+    /// Failing that the session already on the card keeps it, unless a rival has been
+    /// active `SWITCH_MARGIN` longer, which is what stops several busy sessions from
+    /// trading the card back and forth. Only with no incumbent does the most recently
+    /// active session simply win.
+    pub fn snapshot_focused(&mut self, hint: Option<&FocusHint>) -> Option<Snapshot> {
+        let chosen = self.choose(hint)?;
+        self.primary = Some(chosen.clone());
+        let primary = self.sessions.get(&chosen)?.clone();
 
-        // Ties are broken by start time so the result is deterministic rather than
-        // dependent on HashMap ordering.
-        let primary = match focused {
-            Some(s) => s.clone(),
-            None => self
-                .sessions
-                .values()
-                .max_by_key(|s| (s.last_seen, s.started))?
-                .clone(),
-        };
         let oldest_start_unix = self
             .sessions
             .values()
@@ -145,6 +174,46 @@ impl Registry {
             others: self.sessions.len() - 1,
             oldest_start_unix,
         })
+    }
+
+    fn choose(&self, hint: Option<&FocusHint>) -> Option<String> {
+        // The pool the card may be drawn from: the focused window's sessions when we can
+        // identify them, everything otherwise. A focused window running no agent must not
+        // blank the card, so an empty match falls through rather than winning.
+        let matching: Vec<(&String, &Session)> = match hint {
+            Some(h) => self
+                .sessions
+                .iter()
+                .filter(|(_, s)| matches_hint(s, h))
+                .collect(),
+            None => Vec::new(),
+        };
+        let pool: Vec<(&String, &Session)> = if matching.is_empty() {
+            self.sessions.iter().collect()
+        } else {
+            matching
+        };
+
+        // Ties are broken by start time so the result is deterministic rather than
+        // dependent on HashMap ordering.
+        let (best_id, best) = pool.iter().max_by_key(|(_, s)| (s.last_seen, s.started))?;
+
+        // A hint naming exactly one session leaves nothing to stabilise, but Ghostty
+        // reports a working directory rather than a terminal, so two sessions in one repo
+        // still tie — and the incumbent deserves that tie-break too.
+        let incumbent = self
+            .primary
+            .as_ref()
+            .and_then(|id| pool.iter().find(|(pid, _)| *pid == id));
+
+        match incumbent {
+            Some((id, current))
+                if best.last_seen.saturating_duration_since(current.last_seen) < SWITCH_MARGIN =>
+            {
+                Some((*id).clone())
+            }
+            _ => Some((*best_id).clone()),
+        }
     }
 }
 
@@ -290,5 +359,99 @@ mod tests {
     #[test]
     fn empty_registry_yields_no_card() {
         assert!(Registry::default().snapshot().is_none());
+    }
+
+    /// Backdate a session's activity, to stand in for one that has genuinely gone quiet.
+    fn quieten(r: &mut Registry, session: &str, by: Duration) {
+        let s = r.sessions.get_mut(session).unwrap();
+        s.last_seen -= by;
+    }
+
+    #[test]
+    fn busy_sessions_do_not_trade_the_card_back_and_forth() {
+        // The reported bug: four concurrent sessions all firing tool events meant the
+        // card showed whichever fired last, so it flipped project, agent and icon on
+        // every 2s tick.
+        let mut r = Registry::default();
+        for id in ["a", "b", "c", "d"] {
+            r.apply(ev(id, EventKind::Activity(Activity::Editing)));
+        }
+        let first = r.snapshot().unwrap().primary.clone();
+
+        // Every other session reports in, each one now the most recent.
+        for _ in 0..5 {
+            for id in ["b", "c", "d", "a"] {
+                std::thread::sleep(Duration::from_millis(1));
+                r.apply(ev(id, EventKind::Activity(Activity::Reading)));
+                let now = r.snapshot().unwrap();
+                assert_eq!(
+                    now.primary.started, first.started,
+                    "the card changed session while every rival was equally busy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_that_goes_quiet_hands_the_card_over() {
+        let mut r = Registry::default();
+        r.apply(ev("working", EventKind::Activity(Activity::Editing)));
+        r.snapshot().unwrap();
+
+        r.apply(ev("other", EventKind::Activity(Activity::Reading)));
+        // Still within the margin, so the incumbent keeps it.
+        assert_eq!(r.snapshot().unwrap().primary.activity, Activity::Editing);
+
+        // The incumbent stops for longer than the margin.
+        quieten(&mut r, "working", SWITCH_MARGIN * 2);
+        assert_eq!(
+            r.snapshot().unwrap().primary.activity,
+            Activity::Reading,
+            "a session that has genuinely stopped must not hold the card"
+        );
+    }
+
+    #[test]
+    fn focus_still_wins_instantly_over_the_incumbent() {
+        // Hysteresis must not blunt the focus feature: switching windows is the user
+        // saying which session they mean, and that has to take effect on the next tick.
+        let mut r = Registry::default();
+        r.apply(ev_in(
+            "front",
+            EventKind::Activity(Activity::Reading),
+            "/dev/ttys001",
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        r.apply(ev_in(
+            "back",
+            EventKind::Activity(Activity::Editing),
+            "/dev/ttys002",
+        ));
+        // "back" is freshest, so it takes the card first.
+        assert_eq!(r.snapshot().unwrap().primary.activity, Activity::Editing);
+
+        let hint = FocusHint::Tty("/dev/ttys001".into());
+        assert_eq!(
+            r.snapshot_focused(Some(&hint)).unwrap().primary.activity,
+            Activity::Reading,
+            "the focused window must override the incumbent immediately"
+        );
+    }
+
+    #[test]
+    fn ending_the_shown_session_releases_the_card() {
+        let mut r = Registry::default();
+        r.apply(ev("a", EventKind::Activity(Activity::Editing)));
+        r.apply(ev("b", EventKind::Activity(Activity::Reading)));
+        r.snapshot().unwrap();
+
+        r.apply(ev("a", EventKind::SessionEnd));
+        r.apply(ev("b", EventKind::SessionEnd));
+        r.apply(ev("c", EventKind::Activity(Activity::Researching)));
+        assert_eq!(
+            r.snapshot().unwrap().primary.activity,
+            Activity::Researching,
+            "a departed incumbent must not keep the card out of reach"
+        );
     }
 }

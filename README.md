@@ -127,8 +127,14 @@ Daemon
   ! v0.2.3 available — run `agent-presence update`
 ```
 
-That check is the only thing `update_check` controls. Nothing installs itself.
-Set `update_check = false` to switch it off.
+`update_check` only ever reports. Set `auto_update = true` and the daemon will also
+install the release, but only through the package manager that owns the binary and only
+as it shuts down with no session live — an upgrade that lands mid-turn leaves the next
+hook pointing at a file the package manager has already deleted. A standalone binary has
+no manager to delegate to, so it is skipped with a log line rather than guessed at.
+
+Inside `agent-presence config`, an available release shows up in the header and `u`
+installs it. `w` shows what changed in the version you are running.
 
 ## Privacy
 
@@ -177,12 +183,16 @@ idle_timeout = "15m"
 enabled = true
 
 # With several sessions live, show the one in the focused terminal window.
-# Off = always show the most recently active session.
+# Off = keep the current session until another is at least 10 seconds fresher.
 follow_focus = true
 
 # Let the daemon ask GitHub once a day whether a newer release exists.
-# It only reports; installing stays a manual `agent-presence update`.
 update_check = true
+
+# Install it too, on the daemon's own initiative. Off by default. It runs whatever
+# package manager owns the binary — nothing self-overwrites — and only as the daemon
+# shuts down with no session live, so an upgrade cannot land mid-turn.
+auto_update = false
 
 # Up to two link buttons on the card
 # [[buttons]]
@@ -224,6 +234,7 @@ connection strings live. Paths keep only their file name, URLs only their host.
 | reading or searching | Reading code |
 | searching the web | Researching |
 | running subagents | Delegating to subagents |
+| compacting its context | Compacting context |
 | waiting on a permission prompt | Waiting for approval |
 | done, awaiting input | Idle |
 
@@ -231,10 +242,23 @@ Running several sessions at once? The card follows **the terminal window you are
 looking at**, and appends `+2 more` for the rest. Switch windows and the card switches
 with you. The elapsed timer spans your whole coding stretch, not just the newest session.
 
+Outside the focused window, the card is deliberately sticky: a session has to have been
+active ten seconds longer than the one currently shown before it takes over. Without
+that, four busy sessions traded the card back and forth every couple of seconds. Ask
+`agent-presence sessions` which one is on it and why:
+
+```
+Sessions
+  ▸ Claude Code    agent-presence         Editing code
+    /Users/you/code/agent-presence  ·  quiet 0s  ·  up 41m12s
+  · Codex          website                Running commands
+    /Users/you/code/website  ·  quiet 18s  ·  up 6m02s
+```
+
 Focus following is macOS-only for now (Ghostty, iTerm2 and Terminal.app) and needs the
 **Automation** permission macOS asks for the first time it queries your terminal. Deny
-it, set `follow_focus = false`, or run anywhere else, and the card falls back to the most
-recently active session.
+it, set `follow_focus = false`, or run anywhere else, and the card keeps the current
+session until another is at least ten seconds fresher.
 
 ## How it works
 
@@ -270,8 +294,8 @@ The hook binary runs inside your agent's process tree, so it follows three rules
 1. **Never writes to stdout** — Claude Code injects hook stdout into the model's
    context, so anything printed would become text the model reads.
 2. **Always exits 0** — exit code 2 would block the agent's tool call outright.
-3. **Never blocks** — everything is bounded by a 250 ms timeout. A missing or wedged
-   daemon costs a few milliseconds, never a stalled session.
+3. **Bounded delivery** — socket calls time out after 250 ms. A cold start retries
+   delivery for up to roughly one second so the first event is not lost.
 
 If Discord is closed, the daemon keeps running and reconnects when it comes back.
 
@@ -282,7 +306,9 @@ If Discord is closed, the daemon keeps running and reconnects when it comes back
 | `agent-presence install` | Add hooks to Claude Code and Codex |
 | `agent-presence install --uninstall` | Remove them again |
 | `agent-presence config` | Edit settings in a menu, with a live card preview |
-| `agent-presence status` | Daemon, config and Application ID |
+| `agent-presence status` | Daemon, live sessions, config and Application ID |
+| `agent-presence sessions` | What each live session is doing, and which one is on the card |
+| `agent-presence on` / `off` | Show or suppress the card, leaving the hooks in place |
 | `agent-presence doctor` | Diagnose a card that is not appearing |
 | `agent-presence update` | Upgrade through whatever installed the binary |
 | `agent-presence update --check` | Report what is available, install nothing |

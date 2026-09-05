@@ -52,6 +52,7 @@ pub enum Activity {
     Reading,
     Researching,
     Delegating,
+    Compacting,
     AwaitingApproval,
     Idle,
 }
@@ -66,6 +67,7 @@ impl Activity {
             Activity::Reading => "Reading code",
             Activity::Researching => "Researching",
             Activity::Delegating => "Delegating to subagents",
+            Activity::Compacting => "Compacting context",
             Activity::AwaitingApproval => "Waiting for approval",
             Activity::Idle => "Idle",
         }
@@ -126,6 +128,13 @@ impl HookEvent {
                 _ => EventKind::Ignored,
             },
             "SubagentStart" => EventKind::Activity(Activity::Delegating),
+            // The subagent is done, so the parent is back to reasoning about its result.
+            // Without this the card stayed on "Delegating" until the next tool call.
+            "SubagentStop" => EventKind::Activity(Activity::Thinking),
+            // Compaction can take a while and produces no tool events, so the card would
+            // otherwise sit on whatever came before it.
+            "PreCompact" => EventKind::Activity(Activity::Compacting),
+            "PostCompact" => EventKind::Activity(Activity::Thinking),
             _ => EventKind::Ignored,
         };
 
@@ -181,20 +190,32 @@ fn extract_target(tool_name: &str, input: &serde_json::Value) -> Option<String> 
         // reduction — there is no "harmless part" of it. The card just says
         // "Researching".
         "WebSearch" | "web_search" => return None,
-        _ => {
-            let path = input["file_path"]
+        _ => file_label(
+            input["file_path"]
                 .as_str()
-                .or_else(|| input["path"].as_str())?;
-            // Only the file name — never the full path, which would leak directory
-            // structure even before the privacy filter runs.
-            std::path::Path::new(path)
-                .file_name()?
-                .to_string_lossy()
-                .into_owned()
-        }
+                .or_else(|| input["path"].as_str())?,
+        )?,
     };
     let label = label.trim();
     (!label.is_empty()).then(|| label.chars().take(60).collect())
+}
+
+/// `/Users/me/clients/acme/billing.rs` → `billing.rs`.
+///
+/// This branch is reached for *any* tool we do not recognise, MCP servers included, so
+/// it cannot assume the value is really a path. A field named `path` on some third-party
+/// tool may hold anything at all, and whatever survives here is published verbatim. So
+/// the value has to look like a path before its last segment is taken — it needs a
+/// separator or a file extension — and that segment has to be a plain name.
+fn file_label(raw: &str) -> Option<String> {
+    let looks_like_a_path = raw.contains('/') || raw.contains('\\') || raw.contains('.');
+    if !looks_like_a_path {
+        return None;
+    }
+    // Only the file name — never the full path, which would leak directory structure
+    // even before the privacy filter runs.
+    let name = std::path::Path::new(raw).file_name()?.to_str()?;
+    plain_word_of_len(name, 60).map(str::to_owned)
 }
 
 /// `git push origin main 2>&1 | tail -3` → `git push`.
@@ -222,8 +243,12 @@ fn command_label(command: &str) -> Option<String> {
 /// A bare word: letters, digits, `.`, `-`, `_`. Anything else — a path, a flag, a URL, an
 /// assignment, a shell operator, a redirect — is not something we are willing to publish.
 fn plain_word(word: &str) -> Option<&str> {
+    plain_word_of_len(word, 24)
+}
+
+fn plain_word_of_len(word: &str, max: usize) -> Option<&str> {
     let plain = !word.is_empty()
-        && word.len() <= 24
+        && word.len() <= max
         && !word.starts_with('-')
         && word
             .chars()
@@ -367,11 +392,53 @@ mod tests {
 
     #[test]
     fn unknown_events_are_ignored_not_errors() {
+        // Both agents keep adding events; one we do not model must be a no-op, never an
+        // error, because an erroring hook is one the user has to notice.
+        let e = parse(
+            Agent::Claude,
+            r#"{"hook_event_name":"WorktreeCreate","session_id":"s"}"#,
+        );
+        assert_eq!(e.kind, EventKind::Ignored);
+    }
+
+    #[test]
+    fn compaction_is_its_own_activity() {
         let e = parse(
             Agent::Claude,
             r#"{"hook_event_name":"PreCompact","session_id":"s"}"#,
         );
-        assert_eq!(e.kind, EventKind::Ignored);
+        assert_eq!(e.kind, EventKind::Activity(Activity::Compacting));
+    }
+
+    #[test]
+    fn a_finished_subagent_returns_to_thinking() {
+        let e = parse(
+            Agent::Codex,
+            r#"{"hook_event_name":"SubagentStop","session_id":"s"}"#,
+        );
+        assert_eq!(
+            e.kind,
+            EventKind::Activity(Activity::Thinking),
+            "the card must not stay on Delegating after the subagent is done"
+        );
+    }
+
+    #[test]
+    fn an_mcp_path_field_must_look_like_a_path() {
+        // The fallback branch is reached for every unrecognised tool, so a `path` field
+        // holding something that is not a path must be declined, not published.
+        assert_eq!(file_label("/repo/src/main.rs").as_deref(), Some("main.rs"));
+        assert_eq!(file_label("notes.md").as_deref(), Some("notes.md"));
+        assert_eq!(
+            file_label("sk_live_9f2xxxxxxxx"),
+            None,
+            "no separator, no dot"
+        );
+        assert_eq!(
+            file_label("a deploy key"),
+            None,
+            "spaces are not a file name"
+        );
     }
 
     #[test]
