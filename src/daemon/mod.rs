@@ -267,7 +267,11 @@ struct PresenceUpdate {
 async fn drive_presence(mut updates: mpsc::Receiver<PresenceUpdate>) {
     let mut client: Option<(String, DiscordClient)> = None;
 
-    while let Some(update) = updates.recv().await {
+    while let Some(mut update) = updates.recv().await {
+        // A delayed Discord reply must not replay obsolete cards after reconnecting.
+        while let Ok(newer) = updates.try_recv() {
+            update = newer;
+        }
         let reconnect = client
             .as_ref()
             .is_none_or(|(id, _)| *id != update.client_id);
@@ -297,20 +301,23 @@ async fn drive_presence(mut updates: mpsc::Receiver<PresenceUpdate>) {
 /// Worth waiting for: leaving a stale card up is exactly what a user notices, and the
 /// process is about to exit anyway. Not worth waiting forever, since Discord being
 /// unreachable is the ordinary reason this would hang.
-async fn clear_card(tx: mpsc::Sender<PresenceUpdate>, task: tokio::task::JoinHandle<()>) {
-    let cleared = tx
-        .send(PresenceUpdate {
-            client_id: Config::load().effective_client_id(),
-            activity: None,
-        })
-        .await
-        .is_ok();
-    if !cleared {
-        return;
+async fn clear_card(tx: mpsc::Sender<PresenceUpdate>, mut task: tokio::task::JoinHandle<()>) {
+    // The budget includes enqueueing: a full queue behind a stalled Discord connection
+    // must not delay shutdown indefinitely before the timeout even starts.
+    let shutdown = async {
+        let _ = tx
+            .send(PresenceUpdate {
+                client_id: Config::load().effective_client_id(),
+                activity: None,
+            })
+            .await;
+        drop(tx);
+        let _ = (&mut task).await;
+    };
+    if tokio::time::timeout(CLEAR_TIMEOUT, shutdown).await.is_err() {
+        task.abort();
+        let _ = task.await;
     }
-    // Dropping the last sender ends the task's loop once it has drained the queue.
-    drop(tx);
-    let _ = tokio::time::timeout(CLEAR_TIMEOUT, task).await;
 }
 
 /// Resolve the focused terminal off the event loop. The query shells out to
@@ -356,115 +363,54 @@ async fn shutdown_signal() {
 /// `Listener::bind` unlinks whatever it finds — so a second daemon silently steals every
 /// event from the first, and each clears the other's card.
 struct SingleInstance {
-    path: std::path::PathBuf,
-    /// Unix only, and never read: the kernel holds the `flock` for as long as this file
-    /// is open, and releases it when the process exits by any means.
-    #[cfg(unix)]
-    _locked: std::fs::File,
+    /// Keep the same file open until shutdown. Never unlink it: another process may
+    /// already have opened that inode while waiting to claim it.
+    locked: std::fs::File,
 }
 
 impl SingleInstance {
-    /// Take the lock with `flock`, which the kernel releases on exit however we die.
-    ///
-    /// The PID is written *after* the lock is held, and is informational only — an
-    /// earlier version made the file's existence the lock and its content the owner,
-    /// which left a window where the winner had created an empty file but not yet
-    /// written to it. A loser reading that empty file saw no owner, concluded the lock
-    /// was stale, deleted it, and claimed one of its own. Two daemons, every time the
-    /// race was close enough.
-    #[cfg(unix)]
     fn acquire() -> Result<Self> {
-        use std::io::{Seek, Write};
-        use std::os::fd::AsRawFd;
+        use std::io::Write;
 
         let path = config::config_dir().join("daemon.pid");
-        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::create_dir_all(config::config_dir()).context("creating daemon state directory")?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        // Windows keeps this writer exclusive until its handle closes, including on
+        // process death. Readers (status/doctor) remain allowed, but writers and file
+        // deletion are refused. No stale-file detection or staging file is needed.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            options.share_mode(FILE_SHARE_READ);
+        }
 
-        // LOCK_EX | LOCK_NB: fail immediately rather than queue behind the holder.
-        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
-            let holder = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
-            match holder {
-                Some(pid) => anyhow::bail!("daemon already running with pid {pid}"),
-                // The holder has the lock but has not written its pid yet. It is running.
-                None => anyhow::bail!("daemon already running"),
+        let mut file = options.open(&path).with_context(|| {
+            format!(
+                "opening daemon lock {} (another daemon may hold it)",
+                path.display()
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("acquiring daemon lock (another daemon may hold it)");
             }
         }
 
+        // Only the lock holder may replace the informational PID.
         file.set_len(0)?;
-        file.rewind()?;
         file.write_all(std::process::id().to_string().as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         file.flush()?;
-        Ok(Self {
-            path,
-            _locked: file,
-        })
-    }
-
-    /// No `flock` on Windows, so the file itself stays the lock — but it is linked into
-    /// place already carrying the PID, so the empty-file window above cannot occur.
-    #[cfg(windows)]
-    fn acquire() -> Result<Self> {
-        let path = config::config_dir().join("daemon.pid");
-        std::fs::create_dir_all(path.parent().unwrap()).ok();
-
-        let staging = path.with_extension(format!("pid.{}", std::process::id()));
-        std::fs::write(&staging, std::process::id().to_string().as_bytes())
-            .with_context(|| format!("writing {}", staging.display()))?;
-        let _ = StagingGuard(&staging);
-
-        // Two attempts: the first can legitimately lose to a *stale* file left by a
-        // daemon that was killed before its `Drop` ran.
-        for _ in 0..2 {
-            // `hard_link` fails with AlreadyExists rather than overwriting, so it is the
-            // atomic claim, and what lands is a complete file.
-            match std::fs::hard_link(&staging, &path) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Ok(Self { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok());
-                    match holder {
-                        Some(pid) if pid != std::process::id() && process_alive(pid) => {
-                            let _ = std::fs::remove_file(&staging);
-                            anyhow::bail!("daemon already running with pid {pid}")
-                        }
-                        _ => {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(e).with_context(|| format!("claiming {}", path.display()));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&staging);
-        anyhow::bail!("could not claim {}", path.display())
-    }
-}
-
-#[cfg(windows)]
-struct StagingGuard<'a>(&'a std::path::Path);
-
-#[cfg(windows)]
-impl Drop for StagingGuard<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
+        Ok(Self { locked: file })
     }
 }
 
@@ -517,11 +463,10 @@ extern "C" {
 
 impl Drop for SingleInstance {
     fn drop(&mut self) {
-        // Only clear the lock if it is still ours.
-        if let Ok(contents) = std::fs::read_to_string(&self.path) {
-            if contents.trim() == std::process::id().to_string() {
-                let _ = std::fs::remove_file(&self.path);
-            }
+        // Clear the informational PID while still holding the lock. Keeping the file
+        // in place prevents two contenders from locking different inodes at this path.
+        if let Err(error) = self.locked.set_len(0) {
+            tracing::warn!("could not clear daemon PID: {error}");
         }
     }
 }
@@ -568,4 +513,39 @@ fn process_alive(pid: u32) -> bool {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_even_with_a_full_presence_queue() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(PresenceUpdate {
+            client_id: String::new(),
+            activity: None,
+        })
+        .await
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _rx = rx;
+            std::future::pending::<()>().await;
+        });
+        let handle = task.abort_handle();
+        let result =
+            tokio::time::timeout(CLEAR_TIMEOUT + Duration::from_secs(2), clear_card(tx, task))
+                .await;
+        if result.is_err() {
+            handle.abort();
+        }
+        assert!(
+            result.is_ok(),
+            "shutdown must bound the send and the Discord task"
+        );
+        assert!(
+            handle.is_finished(),
+            "a timed-out Discord task must be stopped"
+        );
+    }
 }

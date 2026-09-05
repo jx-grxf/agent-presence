@@ -298,7 +298,7 @@ async fn status() -> Result<()> {
         if config.follow_focus {
             "follows the focused window"
         } else {
-            "most recent session"
+            "stable session selection (10s switch margin)"
         },
     );
     let enabled = if config.enabled {

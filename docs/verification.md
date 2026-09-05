@@ -28,12 +28,12 @@ pipes here rather than sockets, and the daemon is spawned with `DETACHED_PROCESS
 3. Run a session end to end. **No console window may flash** when a hook fires or when
    the daemon starts — that is what `CREATE_NO_WINDOW` is for and it is easy to regress.
 4. `agent-presence status` → daemon pid; `agent-presence stop` → gone (`tasklist` path).
-5. Focus following is not implemented on Windows. Confirm the card falls back to the
-   most recently active session rather than clearing.
+5. Focus following is not implemented on Windows. Confirm the card falls back to a
+   stable session, switching only when another is at least ten seconds fresher.
 6. Config lands in `%APPDATA%\agent-presence\`, not `~/.config`.
-7. The single-instance lock has no `flock` here and falls back to hard-linking the pid
-   file into place. Start two daemons at once and confirm exactly one survives — this is
-   the one guarantee that is implemented differently per platform.
+7. The single-instance lock uses Windows file sharing to allow PID readers while
+   excluding other writers and deletion. Start two daemons at once and confirm exactly
+   one survives; kill it and confirm a successor can acquire the same file.
 
 ## Several sessions at once (the case that regressed)
 

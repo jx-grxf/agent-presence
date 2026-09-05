@@ -21,7 +21,7 @@ mkdir -p "$out"
 digest() {
   local file="${artifacts}/agent-presence-${tag}-${1}.${2}.sha256"
   [ -f "$file" ] || { echo "missing $file" >&2; exit 1; }
-  tr -d '[:space:]' < "$file"
+  awk 'NR == 1 {print $1}' "$file"
 }
 url() {
   echo "${base}/agent-presence-${tag}-${1}.${2}"

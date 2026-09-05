@@ -183,7 +183,7 @@ idle_timeout = "15m"
 enabled = true
 
 # With several sessions live, show the one in the focused terminal window.
-# Off = always show the most recently active session.
+# Off = keep the current session until another is at least 10 seconds fresher.
 follow_focus = true
 
 # Let the daemon ask GitHub once a day whether a newer release exists.
@@ -257,8 +257,8 @@ Sessions
 
 Focus following is macOS-only for now (Ghostty, iTerm2 and Terminal.app) and needs the
 **Automation** permission macOS asks for the first time it queries your terminal. Deny
-it, set `follow_focus = false`, or run anywhere else, and the card falls back to the most
-recently active session.
+it, set `follow_focus = false`, or run anywhere else, and the card keeps the current
+session until another is at least ten seconds fresher.
 
 ## How it works
 
@@ -294,8 +294,8 @@ The hook binary runs inside your agent's process tree, so it follows three rules
 1. **Never writes to stdout** — Claude Code injects hook stdout into the model's
    context, so anything printed would become text the model reads.
 2. **Always exits 0** — exit code 2 would block the agent's tool call outright.
-3. **Never blocks** — everything is bounded by a 250 ms timeout. A missing or wedged
-   daemon costs a few milliseconds, never a stalled session.
+3. **Bounded delivery** — socket calls time out after 250 ms. A cold start retries
+   delivery for up to roughly one second so the first event is not lost.
 
 If Discord is closed, the daemon keeps running and reconnects when it comes back.
 

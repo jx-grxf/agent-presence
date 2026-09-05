@@ -313,7 +313,9 @@ mod humantime_secs {
             's' => (&s[..s.len() - 1], 1),
             _ => (s, 1),
         };
-        Some(Duration::from_secs(num.trim().parse::<u64>().ok()? * mult))
+        Some(Duration::from_secs(
+            num.trim().parse::<u64>().ok()?.checked_mul(mult)?,
+        ))
     }
 }
 
@@ -350,6 +352,14 @@ mod tests {
         assert!(!c.show_model);
         assert_eq!(c.idle_timeout, Duration::from_secs(300));
         assert_eq!(c.buttons.len(), 1);
+    }
+
+    #[test]
+    fn overflowing_durations_are_rejected() {
+        for unit in ["m", "h"] {
+            let input = format!("idle_timeout = \"{}{unit}\"", u64::MAX);
+            assert!(toml::from_str::<Config>(&input).is_err());
+        }
     }
 
     #[test]

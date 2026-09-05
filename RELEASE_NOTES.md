@@ -23,8 +23,8 @@ the lock and its contents the owner, leaving a window where the file existed but
 nobody — and a second daemon reading it there decided the lock was stale and took it. Both
 then bound the control socket, and since binding unlinks whatever it finds, the newcomer
 silently stole every event from the incumbent while the two cleared each other's card. The
-lock is now held by the kernel through `flock`, which also releases it correctly when a
-daemon is killed outright.
+lock is now held by the operating system (`flock` on Unix, an exclusive writer handle
+on Windows), which also releases it correctly when a daemon is killed outright.
 
 **`agent-presence update` reported restarts it had not performed.** It signalled the old
 daemon and launched the replacement immediately, but the old one still had to clear the
@@ -55,7 +55,8 @@ Also: the card reports context compaction and stops claiming to be delegating on
 subagent has finished; approvals show up immediately rather than several seconds late;
 Codex sessions end when they end instead of lingering until the idle timeout; a hook
 whose daemon is still starting retries delivery instead of losing the event; and the
-control socket is owner-only.
+Unix control socket is owner-only. Delayed Discord replies no longer replay queued stale
+cards or bypass the shutdown timeout, and overflowing idle durations are rejected.
 
 ## v0.2.3
 
