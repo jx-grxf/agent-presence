@@ -6,11 +6,14 @@
 use crate::config::{Config, Detail};
 use crate::daemon::registry::Snapshot;
 use crate::discord::{self, Assets, Button, Timestamps};
+use globset::GlobSet;
 use std::path::Path;
 
-pub fn build(snapshot: &Snapshot, config: &Config) -> discord::Activity {
+/// `hidden` is compiled by the caller and reused across ticks — building it here meant
+/// recompiling every glob in the config twice a second, and once per TUI frame.
+pub fn build(snapshot: &Snapshot, config: &Config, hidden: &GlobSet) -> discord::Activity {
     let session = &snapshot.primary;
-    let detail = effective_detail(session.cwd.as_deref(), config);
+    let detail = effective_detail(session.cwd.as_deref(), config, hidden);
 
     // Line 1: who is working, and on what (if allowed).
     let details = match (detail, project_label(session.cwd.as_deref())) {
@@ -65,9 +68,9 @@ pub fn build(snapshot: &Snapshot, config: &Config) -> discord::Activity {
 }
 
 /// A hidden path is forced back to `Generic` no matter what `detail` says.
-fn effective_detail(cwd: Option<&str>, config: &Config) -> Detail {
+fn effective_detail(cwd: Option<&str>, config: &Config, hidden: &GlobSet) -> Detail {
     match cwd {
-        Some(path) if config.hidden_matcher().is_match(path) => Detail::Generic,
+        Some(path) if hidden.is_match(path) => Detail::Generic,
         _ => config.detail,
     }
 }
@@ -93,7 +96,7 @@ fn git_branch(cwd: Option<&str>) -> Option<String> {
     }
 }
 
-/// `claude-opus-4-8` → `Opus 4.8`; `gpt-5-codex` → `GPT-5 Codex`.
+/// `claude-opus-4-8` → `Opus 4.8`; `gpt-5-codex` → `GPT 5 Codex`.
 fn pretty_model(raw: &str) -> String {
     let cleaned = raw.strip_prefix("claude-").unwrap_or(raw);
     // Drop dated suffixes like `-20251001`.
@@ -142,6 +145,11 @@ mod tests {
     use crate::event::{Activity, Agent};
     use std::time::Instant;
 
+    /// The matcher the daemon would have compiled for this config.
+    fn hidden(config: &Config) -> globset::GlobSet {
+        config.hidden_matcher()
+    }
+
     fn snapshot(cwd: &str, others: usize) -> Snapshot {
         let now = Instant::now();
         Snapshot {
@@ -163,7 +171,11 @@ mod tests {
 
     #[test]
     fn generic_default_never_leaks_the_project_name() {
-        let a = build(&snapshot("/Users/me/secret-thing", 0), &Config::default());
+        let a = build(
+            &snapshot("/Users/me/secret-thing", 0),
+            &Config::default(),
+            &hidden(&Config::default()),
+        );
         let rendered = format!("{:?}", a);
         assert!(
             !rendered.contains("secret-thing"),
@@ -179,7 +191,11 @@ mod tests {
             detail: Detail::Project,
             ..Default::default()
         };
-        let a = build(&snapshot("/Users/me/secret-thing", 0), &config);
+        let a = build(
+            &snapshot("/Users/me/secret-thing", 0),
+            &config,
+            &hidden(&config),
+        );
         assert_eq!(a.details.as_deref(), Some("secret-thing"));
     }
 
@@ -190,7 +206,11 @@ mod tests {
             hidden_paths: vec!["/Users/me/work/**".into()],
             ..Default::default()
         };
-        let a = build(&snapshot("/Users/me/work/client-repo", 0), &config);
+        let a = build(
+            &snapshot("/Users/me/work/client-repo", 0),
+            &config,
+            &hidden(&config),
+        );
         assert_eq!(
             a.details.as_deref(),
             Some("Claude Code"),
@@ -204,13 +224,17 @@ mod tests {
             detail: Detail::Full,
             ..Default::default()
         };
-        let a = build(&snapshot("/Users/me/repo", 0), &config);
+        let a = build(&snapshot("/Users/me/repo", 0), &config, &hidden(&config));
         assert!(a.state.unwrap().starts_with("Editing code: main.rs"));
     }
 
     #[test]
     fn concurrent_sessions_are_counted() {
-        let a = build(&snapshot("/Users/me/repo", 2), &Config::default());
+        let a = build(
+            &snapshot("/Users/me/repo", 2),
+            &Config::default(),
+            &hidden(&Config::default()),
+        );
         assert!(a.state.unwrap().ends_with("+2 more"));
     }
 
@@ -232,7 +256,7 @@ mod tests {
             show_model: false,
             ..Default::default()
         };
-        let a = build(&snapshot("/Users/me/repo", 0), &config);
+        let a = build(&snapshot("/Users/me/repo", 0), &config, &hidden(&config));
         assert_eq!(a.state.as_deref(), Some("Editing code"));
     }
 }

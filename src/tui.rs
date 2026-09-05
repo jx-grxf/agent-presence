@@ -68,7 +68,7 @@ impl Field {
             Field::Enabled => "Master switch. Off keeps the hooks installed but clears the card.",
             Field::UpdateCheck => "Ask GitHub once a day whether a newer release exists.",
             Field::IdleTimeout => "Drop sessions silent this long. Accepts 30s, 15m, 2h.",
-            Field::HiddenPaths => "Globs always forced to generic. One per line, ~ expands.",
+            Field::HiddenPaths => "Globs always forced to generic. Comma separated, ~ expands.",
             Field::ClientId => "Your own Discord application. Empty uses the bundled one.",
         }
     }
@@ -252,7 +252,7 @@ fn toggle(config: &mut Config, field: Field, backwards: bool) {
 
 fn current_text(config: &Config, field: Field) -> String {
     match field {
-        Field::IdleTimeout => humanize(config.idle_timeout),
+        Field::IdleTimeout => crate::config::humanize(config.idle_timeout),
         Field::HiddenPaths => config.hidden_paths.join(", "),
         Field::ClientId => config.client_id.clone(),
         _ => String::new(),
@@ -274,12 +274,15 @@ fn commit(config: &mut Config, field: Field, value: &str) -> Result<()> {
             config.idle_timeout = parsed.idle_timeout;
         }
         Field::HiddenPaths => {
-            config.hidden_paths = value
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
+            let patterns = crate::config::split_globs(value);
+            // Reject here rather than at load time. A glob that fails to compile is
+            // dropped by the matcher, which means the user walks away believing a
+            // repository is hidden when it is not — the one mistake this field cannot
+            // be allowed to make quietly.
+            for pattern in &patterns {
+                crate::config::compile_glob(pattern)?;
+            }
+            config.hidden_paths = patterns;
         }
         Field::ClientId => {
             anyhow::ensure!(
@@ -291,15 +294,6 @@ fn commit(config: &mut Config, field: Field, value: &str) -> Result<()> {
         _ => {}
     }
     Ok(())
-}
-
-fn humanize(d: Duration) -> String {
-    let secs = d.as_secs();
-    match secs {
-        s if s % 3600 == 0 && s > 0 => format!("{}h", s / 3600),
-        s if s % 60 == 0 && s > 0 => format!("{}m", s / 60),
-        s => format!("{s}s"),
-    }
 }
 
 fn value_of(config: &Config, field: Field) -> String {
@@ -315,7 +309,7 @@ fn value_of(config: &Config, field: Field) -> String {
         Field::FollowFocus => onoff(config.follow_focus),
         Field::UpdateCheck => onoff(config.update_check),
         Field::Enabled => onoff(config.enabled),
-        Field::IdleTimeout => humanize(config.idle_timeout),
+        Field::IdleTimeout => crate::config::humanize(config.idle_timeout),
         Field::HiddenPaths => {
             if config.hidden_paths.is_empty() {
                 "none".into()
@@ -355,7 +349,7 @@ pub fn preview_card(config: &Config) -> (String, String) {
         others: 0,
         oldest_start_unix: 0,
     };
-    let activity = presence::build(&snapshot, config).sanitized();
+    let activity = presence::build(&snapshot, config, &config.hidden_matcher()).sanitized();
     (
         activity.details.unwrap_or_default(),
         activity.state.unwrap_or_default(),
@@ -449,7 +443,7 @@ fn draw(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::Red),
         )),
         (Mode::Saved(_), _) => Line::from(Span::styled(
-            "  ✓ saved — restart the daemon with `agent-presence stop`",
+            "  ✓ saved — the running daemon picks it up within a couple of seconds",
             Style::new().fg(Color::Green),
         )),
         (Mode::Edit { .. }, _) => Line::from(Span::styled(
@@ -623,8 +617,8 @@ mod tests {
 
     #[test]
     fn durations_render_in_the_unit_they_were_written() {
-        assert_eq!(humanize(Duration::from_secs(900)), "15m");
-        assert_eq!(humanize(Duration::from_secs(7200)), "2h");
-        assert_eq!(humanize(Duration::from_secs(45)), "45s");
+        assert_eq!(crate::config::humanize(Duration::from_secs(900)), "15m");
+        assert_eq!(crate::config::humanize(Duration::from_secs(7200)), "2h");
+        assert_eq!(crate::config::humanize(Duration::from_secs(45)), "45s");
     }
 }

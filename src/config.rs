@@ -124,15 +124,65 @@ impl Config {
     pub fn hidden_matcher(&self) -> GlobSet {
         let mut builder = GlobSetBuilder::new();
         for pattern in &self.hidden_paths {
-            let expanded = expand_tilde(pattern);
-            match Glob::new(&expanded) {
+            match compile_glob(pattern) {
                 Ok(g) => {
                     builder.add(g);
                 }
-                Err(e) => tracing::warn!("ignoring invalid hidden_paths glob {pattern:?}: {e}"),
+                Err(e) => tracing::warn!("ignoring invalid hidden_paths glob {pattern:?}: {e:#}"),
             }
         }
         builder.build().unwrap_or_else(|_| GlobSet::empty())
+    }
+}
+
+/// One `hidden_paths` entry, tilde expanded and compiled.
+///
+/// Shared with the settings editor so a pattern that would be dropped at load time is
+/// rejected while it is being typed instead. A glob that silently fails to compile is
+/// the worst outcome available here: the user believes a repository is hidden, and it
+/// is not.
+pub fn compile_glob(pattern: &str) -> Result<Glob> {
+    Glob::new(&expand_tilde(pattern)).with_context(|| format!("bad glob {pattern:?}"))
+}
+
+/// Split a comma-separated list of globs without cutting brace alternations in half.
+///
+/// `~/{work,clients}/**` is one pattern, not two — splitting it naively produced `~/{work`
+/// and `clients}/**`, neither of which compiles, so both were dropped and the paths the
+/// user meant to hide were published.
+pub fn split_globs(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for c in raw.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    out.push(current);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `900s` → `15m`. Written back into the config file so a hand-edited `"15m"` does not
+/// come back as `"900s"` the next time the editor saves.
+pub fn humanize(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        s if s % 3600 == 0 && s > 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 && s > 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
     }
 }
 
@@ -171,7 +221,26 @@ pub fn log_path() -> PathBuf {
 }
 
 /// Control socket shared by the hook processes and the daemon.
+///
+/// `AGENT_PRESENCE_HOME` moves this too, not just the config file. An instance pointed at
+/// its own home has to be genuinely isolated — otherwise a second one binds the socket
+/// the first is listening on, and `Listener::bind` unlinks whatever it finds.
 pub fn control_socket_path() -> PathBuf {
+    if let Ok(explicit) = std::env::var("AGENT_PRESENCE_HOME") {
+        let dir = PathBuf::from(explicit);
+        #[cfg(windows)]
+        {
+            // Named pipes are not filesystem paths, so isolate by name instead.
+            let key: String = dir
+                .to_string_lossy()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect();
+            return PathBuf::from(format!(r"\\.\pipe\agent-presence-{key}"));
+        }
+        #[cfg(unix)]
+        return dir.join("control.sock");
+    }
     #[cfg(windows)]
     {
         PathBuf::from(r"\\.\pipe\agent-presence")
@@ -198,7 +267,7 @@ mod humantime_secs {
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}s", d.as_secs()))
+        s.serialize_str(&super::humanize(*d))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
@@ -257,6 +326,58 @@ mod tests {
     fn empty_config_file_yields_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.detail, Detail::Generic);
+    }
+
+    #[test]
+    fn brace_alternations_survive_the_comma_split() {
+        // Splitting naively produced `~/work/{a` and `b}/**`, neither of which compiles,
+        // so both were dropped — and the repositories the user meant to hide were
+        // published instead.
+        assert_eq!(
+            split_globs("~/work/{acme,globex}/**, ~/clients/**"),
+            vec!["~/work/{acme,globex}/**", "~/clients/**"]
+        );
+        assert_eq!(
+            split_globs("  ~/a/** , , ~/b/**  "),
+            vec!["~/a/**", "~/b/**"]
+        );
+        assert!(split_globs("").is_empty());
+    }
+
+    #[test]
+    fn a_brace_glob_actually_hides_the_path() {
+        let c = Config {
+            hidden_paths: split_globs("~/work/{acme,globex}/**"),
+            ..Default::default()
+        };
+        let m = c.hidden_matcher();
+        assert!(m.is_match(home().join("work/acme/billing")));
+        assert!(m.is_match(home().join("work/globex/api")));
+        assert!(!m.is_match(home().join("work/personal/blog")));
+    }
+
+    #[test]
+    fn an_uncompilable_glob_is_reported_rather_than_dropped() {
+        assert!(compile_glob("~/work/**").is_ok());
+        assert!(
+            compile_glob("~/work/{unclosed").is_err(),
+            "the editor has to be able to refuse this instead of silently ignoring it"
+        );
+    }
+
+    #[test]
+    fn durations_round_trip_in_the_unit_they_were_written() {
+        let c = Config {
+            idle_timeout: Duration::from_secs(900),
+            ..Default::default()
+        };
+        let text = toml::to_string(&c).unwrap();
+        assert!(
+            text.contains(r#"idle_timeout = "15m""#),
+            "a hand-written 15m must not come back as 900s: {text}"
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.idle_timeout, c.idle_timeout);
     }
 
     #[test]

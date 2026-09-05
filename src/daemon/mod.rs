@@ -27,9 +27,50 @@ const SHUTDOWN_AFTER_IDLE: Duration = Duration::from_secs(90);
 /// Ceiling on the focused-window query, so a stalled terminal cannot stall the tick.
 const FOCUS_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// The config as the daemon sees it: reloaded when the file changes, with the privacy
+/// globs compiled once rather than on every tick.
+struct LiveConfig {
+    config: Config,
+    hidden: globset::GlobSet,
+    stamp: Option<std::time::SystemTime>,
+}
+
+impl LiveConfig {
+    fn load() -> Self {
+        let config = Config::load();
+        Self {
+            hidden: config.hidden_matcher(),
+            config,
+            stamp: file_stamp(),
+        }
+    }
+
+    /// Pick up hand edits and `agent-presence config` without a restart. One `stat` per
+    /// tick; the file is only read when its mtime actually moved.
+    fn reload_if_changed(&mut self) -> bool {
+        let stamp = file_stamp();
+        if stamp == self.stamp {
+            return false;
+        }
+        self.stamp = stamp;
+        let config = Config::load();
+        self.hidden = config.hidden_matcher();
+        let client_id_changed = config.effective_client_id() != self.config.effective_client_id();
+        self.config = config;
+        tracing::info!("config reloaded");
+        client_id_changed
+    }
+}
+
+fn file_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config::config_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 pub async fn run() -> Result<()> {
     let _lock = SingleInstance::acquire()?;
-    let config = Config::load();
+    let mut live = LiveConfig::load();
     let socket = config::control_socket_path();
 
     let (tx, mut rx) = mpsc::channel::<HookEvent>(256);
@@ -67,7 +108,7 @@ pub async fn run() -> Result<()> {
 
     tracing::info!("daemon listening on {}", socket.display());
 
-    if config.update_check {
+    if live.config.update_check {
         // Off the event loop and off the critical path: curl can sit on a DNS timeout
         // for seconds, and a presence tick must not wait behind it. The result only
         // lands in a cache file that `status` and `doctor` read later.
@@ -76,7 +117,7 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    let mut client = DiscordClient::new(config.effective_client_id());
+    let mut client = DiscordClient::new(live.config.effective_client_id());
     let mut registry = Registry::default();
     let mut ticker = tokio::time::interval(TICK);
     let mut idle_since: Option<std::time::Instant> = Some(std::time::Instant::now());
@@ -88,6 +129,12 @@ pub async fn run() -> Result<()> {
                 registry.apply(event);
             }
             _ = ticker.tick() => {
+                if live.reload_if_changed() {
+                    // A different application means a different connection entirely.
+                    let _ = client.set_activity(None).await;
+                    client = DiscordClient::new(live.config.effective_client_id());
+                }
+                let config = &live.config;
                 registry.expire(config.idle_timeout);
 
                 // Only worth asking the window server when there is a choice to make.
@@ -100,7 +147,7 @@ pub async fn run() -> Result<()> {
                 let desired = registry
                     .snapshot_focused(hint.as_ref())
                     .filter(|_| config.enabled)
-                    .map(|snap| presence::build(&snap, &config));
+                    .map(|snap| presence::build(&snap, config, &live.hidden));
 
                 if let Err(e) = client.set_activity(desired).await {
                     // Expected whenever Discord is closed. Stay alive and retry.
@@ -163,35 +210,88 @@ async fn shutdown_signal() {
     }
 }
 
-/// Lock file holding the daemon PID, so concurrent `SessionStart` hooks racing to
-/// spawn a daemon end up with exactly one.
+/// Lock file holding the daemon PID, so concurrent hooks racing to spawn a daemon end
+/// up with exactly one.
+///
+/// Losing this race has to be reliable: both winners would bind the control socket, and
+/// `Listener::bind` unlinks whatever it finds — so a second daemon silently steals every
+/// event from the first, and each clears the other's card.
 struct SingleInstance {
     path: std::path::PathBuf,
+    /// Unix only, and never read: the kernel holds the `flock` for as long as this file
+    /// is open, and releases it when the process exits by any means.
+    #[cfg(unix)]
+    _locked: std::fs::File,
 }
 
 impl SingleInstance {
+    /// Take the lock with `flock`, which the kernel releases on exit however we die.
+    ///
+    /// The PID is written *after* the lock is held, and is informational only — an
+    /// earlier version made the file's existence the lock and its content the owner,
+    /// which left a window where the winner had created an empty file but not yet
+    /// written to it. A loser reading that empty file saw no owner, concluded the lock
+    /// was stale, deleted it, and claimed one of its own. Two daemons, every time the
+    /// race was close enough.
+    #[cfg(unix)]
+    fn acquire() -> Result<Self> {
+        use std::io::{Seek, Write};
+        use std::os::fd::AsRawFd;
+
+        let path = config::config_dir().join("daemon.pid");
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+
+        // LOCK_EX | LOCK_NB: fail immediately rather than queue behind the holder.
+        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+            let holder = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            match holder {
+                Some(pid) => anyhow::bail!("daemon already running with pid {pid}"),
+                // The holder has the lock but has not written its pid yet. It is running.
+                None => anyhow::bail!("daemon already running"),
+            }
+        }
+
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(std::process::id().to_string().as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.flush()?;
+        Ok(Self {
+            path,
+            _locked: file,
+        })
+    }
+
+    /// No `flock` on Windows, so the file itself stays the lock — but it is linked into
+    /// place already carrying the PID, so the empty-file window above cannot occur.
+    #[cfg(windows)]
     fn acquire() -> Result<Self> {
         let path = config::config_dir().join("daemon.pid");
         std::fs::create_dir_all(path.parent().unwrap()).ok();
 
-        // Created with O_EXCL rather than read-then-write: any hook event may now spawn
-        // a daemon, so two of them racing on the same lock is an ordinary occurrence
-        // and the loser has to lose reliably. Otherwise both would bind the control
-        // socket, and `Listener::bind` unlinks whatever it finds — the second daemon
-        // would silently steal every event from the first.
-        //
+        let staging = path.with_extension(format!("pid.{}", std::process::id()));
+        std::fs::write(&staging, std::process::id().to_string().as_bytes())
+            .with_context(|| format!("writing {}", staging.display()))?;
+        let _ = StagingGuard(&staging);
+
         // Two attempts: the first can legitimately lose to a *stale* file left by a
         // daemon that was killed before its `Drop` ran.
         for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(std::process::id().to_string().as_bytes())
-                        .with_context(|| format!("writing {}", path.display()))?;
+            // `hard_link` fails with AlreadyExists rather than overwriting, so it is the
+            // atomic claim, and what lands is a complete file.
+            match std::fs::hard_link(&staging, &path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&staging);
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -200,6 +300,7 @@ impl SingleInstance {
                         .and_then(|s| s.trim().parse::<u32>().ok());
                     match holder {
                         Some(pid) if pid != std::process::id() && process_alive(pid) => {
+                            let _ = std::fs::remove_file(&staging);
                             anyhow::bail!("daemon already running with pid {pid}")
                         }
                         _ => {
@@ -207,11 +308,30 @@ impl SingleInstance {
                         }
                     }
                 }
-                Err(e) => return Err(e).with_context(|| format!("claiming {}", path.display())),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(e).with_context(|| format!("claiming {}", path.display()));
+                }
             }
         }
+        let _ = std::fs::remove_file(&staging);
         anyhow::bail!("could not claim {}", path.display())
     }
+}
+
+#[cfg(windows)]
+struct StagingGuard<'a>(&'a std::path::Path);
+
+#[cfg(windows)]
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 /// Launch `exe daemon` fully detached, so it outlives whatever started it.
@@ -271,6 +391,23 @@ pub fn running_pid() -> Option<u32> {
     let contents = std::fs::read_to_string(config::config_dir().join("daemon.pid")).ok()?;
     let pid = contents.trim().parse::<u32>().ok()?;
     process_alive(pid).then_some(pid)
+}
+
+/// Block until `pid` is gone, or `budget` runs out. Returns whether it actually exited.
+///
+/// A stopped daemon does not die at the instant it is signalled: it still has to clear
+/// the Discord card, which is a round trip to a socket that may not answer. Starting a
+/// replacement before that finishes means the replacement loses the lock and exits, and
+/// nothing is left running at all — the exact failure `update` used to report as success.
+pub fn await_exit(pid: u32, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !process_alive(pid)
 }
 
 #[cfg(unix)]

@@ -13,24 +13,43 @@ use std::path::{Path, PathBuf};
 
 /// Events we subscribe to. `PostToolUse` is deliberately absent: it would double the
 /// number of hook invocations without changing what the card shows.
+///
+/// `PermissionRequest` is subscribed alongside `Notification` rather than instead of it.
+/// Both report a pending approval, but `Notification` only fires once Claude Code
+/// decides the wait is worth interrupting you over, which is several seconds in — so on
+/// its own the card was late to say "Waiting for approval".
 const CLAUDE_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
+    "PermissionRequest",
     "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
     "Stop",
     "SessionEnd",
 ];
 
-/// Codex fires no `SessionEnd`; those sessions are reaped by the daemon's idle timeout.
+/// Codex's event set, which differs from Claude's only in lacking `Notification`.
 const CODEX_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PermissionRequest",
     "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
     "Stop",
+    "SessionEnd",
 ];
+
+fn events_for(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        Agent::Claude => CLAUDE_EVENTS,
+        Agent::Codex => CODEX_EVENTS,
+    }
+}
 
 pub fn config_file(agent: Agent) -> PathBuf {
     match agent {
@@ -54,6 +73,47 @@ pub fn is_installed(path: &Path) -> bool {
         return false;
     };
     text.contains("agent-presence")
+}
+
+/// Which of an agent's events actually carry our hook right now.
+#[derive(Debug, Default, Clone)]
+pub struct HookStatus {
+    pub wired: Vec<&'static str>,
+    pub missing: Vec<&'static str>,
+}
+
+impl HookStatus {
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty() && !self.wired.is_empty()
+    }
+}
+
+/// Read a config file back and report per-event coverage.
+///
+/// `doctor` needs this rather than a yes/no: a release that subscribes to a new event
+/// leaves existing installs partially wired, and "hooks are installed" would hide that
+/// the card no longer reports approvals.
+pub fn status(path: &Path, agent: Agent) -> HookStatus {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HookStatus::default();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return HookStatus::default();
+    };
+
+    let mut status = HookStatus::default();
+    for event in events_for(agent) {
+        let wired = root["hooks"][*event]
+            .as_array()
+            .map(|list| list.iter().any(matcher_is_ours))
+            .unwrap_or(false);
+        if wired {
+            status.wired.push(event);
+        } else {
+            status.missing.push(event);
+        }
+    }
+    status
 }
 
 /// What `apply` did to one agent's config.
@@ -234,10 +294,7 @@ fn pick_stable(exe: &Path, target: &Path, candidates: impl Iterator<Item = PathB
 
 fn add_hooks(root: &mut Value, agent: Agent) -> Result<bool> {
     let exe = stable_exe_path()?;
-    let events = match agent {
-        Agent::Claude => CLAUDE_EVENTS,
-        Agent::Codex => CODEX_EVENTS,
-    };
+    let events = events_for(agent);
 
     let hooks = root
         .as_object_mut()
@@ -446,6 +503,107 @@ mod tests {
             [PathBuf::from("/usr/bin/agent-presence")].into_iter(),
         );
         assert_eq!(picked, exe);
+    }
+
+    #[test]
+    fn unrelated_settings_keep_their_original_order() {
+        // serde_json's default map is a BTreeMap, which sorted the user's whole
+        // settings.json alphabetically on every install — a huge diff in a file we were
+        // only meant to add one key to.
+        let original = r#"{"model":"opus","includeCoAuthoredBy":false,"env":{"A":"1"}}"#;
+        let mut root: Value = serde_json::from_str(original).unwrap();
+        add_hooks(&mut root, Agent::Claude).unwrap();
+
+        let rendered = serde_json::to_string(&root).unwrap();
+        let model = rendered.find("model").unwrap();
+        let coauthored = rendered.find("includeCoAuthoredBy").unwrap();
+        let env = rendered.find(r#""env""#).unwrap();
+        assert!(
+            model < coauthored && coauthored < env,
+            "install reordered the user's settings: {rendered}"
+        );
+    }
+
+    #[test]
+    fn status_reports_a_partially_wired_install() {
+        // What an older install looks like after a release subscribes to a new event.
+        let dir = std::env::temp_dir().join(format!("ap-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut root = json!({});
+        add_hooks(&mut root, Agent::Claude).unwrap();
+        root["hooks"].as_object_mut().unwrap().remove("PreCompact");
+        std::fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+
+        let status = status(&path, Agent::Claude);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!status.complete(), "a missing event must not read as done");
+        assert_eq!(status.missing, vec!["PreCompact"]);
+        assert!(status.wired.contains(&"PreToolUse"));
+    }
+
+    #[test]
+    fn status_of_a_file_without_our_hooks_is_empty_not_partial() {
+        let dir = std::env::temp_dir().join(format!("ap-status-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+
+        let status = status(&path, Agent::Claude);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(status.wired.is_empty());
+        assert!(!status.complete());
+    }
+
+    /// The plugin wires the same events without going through this module, so nothing
+    /// stops the two drifting apart — and when they do, plugin users quietly lose
+    /// whatever the new event reported. It shipped a version behind once already.
+    #[test]
+    fn the_plugin_subscribes_to_the_same_events_as_the_installer() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin/hooks/hooks.json");
+        let text = std::fs::read_to_string(manifest).expect("plugin hooks.json");
+        let root: Value = serde_json::from_str(&text).expect("valid JSON");
+        let hooks = root["hooks"].as_object().expect("hooks object");
+
+        let mut declared: Vec<&str> = hooks.keys().map(String::as_str).collect();
+        let mut expected: Vec<&str> = CLAUDE_EVENTS.to_vec();
+        declared.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            declared, expected,
+            "plugin/hooks/hooks.json is out of step with CLAUDE_EVENTS"
+        );
+    }
+
+    #[test]
+    fn the_plugin_version_tracks_the_crate() {
+        let manifest = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugin/.claude-plugin/plugin.json"
+        );
+        let text = std::fs::read_to_string(manifest).expect("plugin.json");
+        let root: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            root["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "bump plugin/.claude-plugin/plugin.json with the crate version"
+        );
+    }
+
+    #[test]
+    fn both_agents_subscribe_to_session_end() {
+        // Codex grew SessionEnd; without it, finished Codex sessions sat on the card
+        // until the idle timeout reaped them a quarter of an hour later.
+        for agent in [Agent::Claude, Agent::Codex] {
+            assert!(
+                events_for(agent).contains(&"SessionEnd"),
+                "{} must be told when a session ends",
+                agent.label()
+            );
+        }
     }
 
     #[test]

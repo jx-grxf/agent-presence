@@ -28,9 +28,6 @@ async fn try_run(agent: Agent) -> Result<()> {
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
     let mut event = HookEvent::parse(agent, &value)?;
-    if event.kind == EventKind::Ignored {
-        return Ok(());
-    }
     // The agent inherits the terminal we are running under, so our own controlling
     // terminal identifies the window the session lives in.
     event.tty = controlling_tty();
@@ -47,17 +44,46 @@ async fn try_run(agent: Agent) -> Result<()> {
         // takes over the job that restriction was doing, which was stopping a burst of
         // tool events from spawning a pile of daemons.
         Ok(Err(e)) => {
+            // An event we do not act on is a liveness ping for a session the daemon
+            // already knows about. It describes no activity, so starting a daemon for
+            // it would produce one with nothing to show that exits again 90s later.
+            if event.kind == EventKind::Ignored {
+                return Ok(());
+            }
             if !claim_spawn_slot() {
                 return Err(e);
             }
             crate::daemon::spawn_detached(&std::env::current_exe()?)?;
-            // Give it a moment to bind, then deliver the event that started it,
-            // otherwise this activity would stay invisible until the next tool call.
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            let _ = tokio::time::timeout(deadline, ipc::send_event(&socket, &event)).await;
+            deliver_to_new_daemon(&socket, &event).await;
             Ok(())
         }
         Err(_) => anyhow::bail!("daemon did not accept the event within {deadline:?}"),
+    }
+}
+
+/// Total time the cold-start path may spend waiting for a daemon it just launched.
+///
+/// Only ever paid when no daemon was running, and the agent allows the hook five
+/// seconds. A single fixed 120 ms sleep used to be the whole budget, which lost the
+/// event outright whenever the new process took longer than that to bind — leaving a
+/// daemon running with no session, and the card dark until the next tool call.
+const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+const HANDOFF_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Deliver the event that started the daemon, retrying while it comes up.
+async fn deliver_to_new_daemon(socket: &std::path::Path, event: &HookEvent) {
+    let deadline = tokio::time::Instant::now() + HANDOFF_BUDGET;
+    loop {
+        tokio::time::sleep(HANDOFF_POLL).await;
+        if let Ok(Ok(())) =
+            tokio::time::timeout(ipc::HOOK_TIMEOUT, ipc::send_event(socket, event)).await
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::debug!("new daemon did not accept the event within {HANDOFF_BUDGET:?}");
+            return;
+        }
     }
 }
 

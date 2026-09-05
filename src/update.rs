@@ -24,6 +24,10 @@ const LATEST_RELEASE_URL: &str = "https://github.com/jx-grxf/agent-presence/rele
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Ceiling on the network call, so neither the daemon nor `update` can hang on it.
 const NETWORK_TIMEOUT: &str = "8";
+/// How long a stopping daemon gets to release its lock before we give up on restarting
+/// it. Generous, because clearing the card can wait on a Discord socket that never
+/// answers — and giving up is cheap, since the next hook event starts one anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
@@ -315,7 +319,18 @@ pub fn run(check_only: bool) -> Result<()> {
 fn restart_daemon() {
     // Nothing was running, so there is nothing to bring back — the next hook event
     // starts one on its own.
-    if crate::stop_daemon().is_none() {
+    let Some(pid) = crate::stop_daemon() else {
+        return;
+    };
+
+    // Signalling is not stopping. The old daemon still has to clear the Discord card
+    // before it releases the single-instance lock, and that is a round trip to a socket
+    // that may not answer for seconds. Starting the replacement first meant it lost the
+    // lock and exited immediately — while this function reported a successful restart.
+    if !crate::daemon::await_exit(pid, SHUTDOWN_GRACE) {
+        ui::warn(&format!(
+            "daemon {pid} did not stop within {SHUTDOWN_GRACE:?} — the next tool call will restart it"
+        ));
         return;
     }
 

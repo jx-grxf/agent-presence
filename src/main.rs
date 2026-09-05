@@ -235,17 +235,33 @@ async fn doctor() -> Result<()> {
     let mut any = false;
     for (agent, path) in install::installed_paths() {
         let present = path.parent().map(std::path::Path::exists).unwrap_or(false);
-        if install::is_installed(&path) {
+        let status = install::status(&path, agent);
+        if status.complete() {
             any = true;
             ui::ok(&format!(
                 "{} {}",
                 agent.label(),
                 ui::dim(&path.display().to_string())
             ));
+        } else if !status.wired.is_empty() {
+            // A release that subscribes to a new event leaves older installs partially
+            // wired. Saying "installed" here would hide a card that has quietly stopped
+            // reporting approvals or compaction.
+            any = true;
+            ui::warn(&format!(
+                "{} wired for {} of {} events — run `agent-presence install` to add {}",
+                agent.label(),
+                status.wired.len(),
+                status.wired.len() + status.missing.len(),
+                status.missing.join(", ")
+            ));
         } else if present {
-            ui::fail(&format!(
-                "{} found, but no hooks — run `agent-presence install`",
-                agent.label()
+            // Not an error: the Claude Code plugin wires the same hooks without touching
+            // this file at all, and that install is perfectly valid.
+            ui::warn(&format!(
+                "{} has no hooks in {} — run `agent-presence install`, or ignore this if you use the plugin",
+                agent.label(),
+                ui::dim(&path.display().to_string())
             ));
         } else {
             ui::field(
@@ -287,9 +303,17 @@ async fn doctor() -> Result<()> {
 }
 
 fn stop() {
-    match stop_daemon() {
-        Some(pid) => println!("stopped daemon (pid {pid})"),
-        None => println!("no daemon running"),
+    let Some(pid) = stop_daemon() else {
+        println!("no daemon running");
+        return;
+    };
+    // Signalling is not stopping — the daemon still has to clear the card. Waiting for
+    // it means this command does not claim more than it did, and that a `stop` followed
+    // immediately by a fresh session cannot race the departing daemon for the lock.
+    if daemon::await_exit(pid, std::time::Duration::from_secs(10)) {
+        println!("stopped daemon (pid {pid})");
+    } else {
+        println!("daemon (pid {pid}) was signalled but is still shutting down");
     }
 }
 
