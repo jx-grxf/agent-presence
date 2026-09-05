@@ -53,6 +53,12 @@ enum Command {
     Config,
     /// Show daemon, config and Discord status.
     Status,
+    /// List the agent sessions the daemon is tracking.
+    Sessions,
+    /// Show the card again, without touching the installed hooks.
+    On,
+    /// Suppress the card, without touching the installed hooks.
+    Off,
     /// Diagnose a setup that is not showing a card.
     Doctor,
     /// Stop a running daemon.
@@ -91,8 +97,11 @@ async fn main() -> Result<()> {
         Command::Hook { agent } => hook::run(agent).await,
         Command::Daemon => daemon::run().await?,
         Command::Install { uninstall, agent } => install::run(uninstall, agent)?,
-        Command::Config => tui::run()?,
-        Command::Status => status()?,
+        Command::Config => tui::run().await?,
+        Command::Status => status().await?,
+        Command::Sessions => sessions().await,
+        Command::On => set_enabled(true)?,
+        Command::Off => set_enabled(false)?,
         Command::Doctor => doctor().await?,
         Command::Stop => stop(),
         Command::Update { check } => update::run(check)?,
@@ -134,7 +143,7 @@ fn init_logging(to_file: bool) {
 }
 
 /// `None` means Discord answered the handshake; `Some` carries why it did not.
-async fn probe_discord() -> Option<String> {
+pub async fn probe_discord() -> Option<String> {
     let id = config::Config::load().effective_client_id();
     if id.is_empty() {
         return Some("no Application ID configured".into());
@@ -146,7 +155,126 @@ async fn probe_discord() -> Option<String> {
         .map(|e| format!("{e:#}"))
 }
 
-fn status() -> Result<()> {
+/// Flip the master switch from the command line, for when the settings menu is more
+/// ceremony than the moment deserves — screen-sharing is about to start, say.
+///
+/// Takes effect on the daemon's next tick, because it reloads the file it just wrote.
+fn set_enabled(enabled: bool) -> Result<()> {
+    let mut config = config::Config::load();
+    let already = config.enabled == enabled;
+    config.enabled = enabled;
+    config.save()?;
+
+    ui::heading(if enabled { "Card on" } else { "Card off" });
+    let state = if enabled {
+        "your agent activity is visible on Discord again"
+    } else {
+        "the card is cleared — hooks stay installed"
+    };
+    ui::ok(state);
+    if already {
+        ui::field("", &ui::dim("(it was already set this way)"));
+    }
+    if daemon::running_pid().is_some() {
+        ui::field(
+            "",
+            &ui::dim("the running daemon picks this up within seconds"),
+        );
+    }
+    Ok(())
+}
+
+async fn sessions() {
+    ui::heading("Sessions");
+    let Some(reply) = ipc::sessions_or_none().await else {
+        ui::field(
+            "state",
+            &ui::dim("no daemon running — nothing is being tracked"),
+        );
+        return;
+    };
+    if reply.sessions.is_empty() {
+        ui::field("state", &ui::dim("daemon running, no live sessions"));
+        return;
+    }
+
+    for session in &reply.sessions {
+        // The marker, not a heading: several sessions are normal, and which one holds
+        // the card is the question this command exists to answer.
+        let marker = if session.on_card {
+            ui::green("▸")
+        } else {
+            ui::dim("·")
+        };
+        let project = session
+            .cwd
+            .as_deref()
+            .and_then(|c| std::path::Path::new(c).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "  {marker} {:<14} {:<22} {}",
+            session.agent.label(),
+            project,
+            ui::dim(session.activity.verb())
+        );
+        println!(
+            "    {}",
+            ui::dim(&format!(
+                "{}  ·  quiet {}  ·  up {}",
+                session.cwd.as_deref().unwrap_or("no working directory"),
+                short_duration(session.quiet_secs),
+                short_duration(session.age_secs),
+            ))
+        );
+    }
+
+    println!(
+        "\n  {}",
+        ui::dim(&format!(
+            "{} marks the session on the card.",
+            if ui::styled() { "▸" } else { "The arrow" }
+        ))
+    );
+    if !reply.card_enabled {
+        ui::warn("the card is switched off — `agent-presence on` to show it again");
+    }
+}
+
+/// One line summarising what the daemon is tracking, for `status` and `doctor`.
+fn describe_sessions(reply: &ipc::SessionsReply) -> String {
+    let Some(on_card) = reply.sessions.iter().find(|s| s.on_card) else {
+        return ui::dim("none live").to_string();
+    };
+    let project = on_card
+        .cwd
+        .as_deref()
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| on_card.agent.label().to_string());
+
+    let others = reply.sessions.len().saturating_sub(1);
+    let rest = match others {
+        0 => String::new(),
+        1 => ui::dim(" · 1 other"),
+        n => ui::dim(&format!(" · {n} others")),
+    };
+    format!(
+        "{} live, showing {}{rest}",
+        reply.sessions.len(),
+        ui::cyan(&project)
+    )
+}
+
+fn short_duration(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s if s >= 60 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{s}s"),
+    }
+}
+
+async fn status() -> Result<()> {
     let config = config::Config::load();
 
     ui::heading("Daemon");
@@ -156,6 +284,9 @@ fn status() -> Result<()> {
             "state",
             &ui::dim("not running — starts with your next session"),
         ),
+    }
+    if let Some(reply) = ipc::sessions_or_none().await {
+        ui::field("sessions", &describe_sessions(&reply));
     }
     report_update(&config);
 
@@ -278,6 +409,12 @@ async fn doctor() -> Result<()> {
     match daemon::running_pid() {
         Some(pid) => ui::ok(&format!("running {}", ui::dim(&format!("pid {pid}")))),
         None => ui::warn("not running — it starts itself with your next tool call"),
+    }
+    if let Some(reply) = ipc::sessions_or_none().await {
+        ui::field("sessions", &describe_sessions(&reply));
+        if !reply.card_enabled {
+            ui::warn("the card is switched off — `agent-presence on` to show it again");
+        }
     }
     ui::field("version", update::current());
     report_update(&config);

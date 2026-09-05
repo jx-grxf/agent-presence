@@ -31,6 +31,24 @@ pipes here rather than sockets, and the daemon is spawned with `DETACHED_PROCESS
 5. Focus following is not implemented on Windows. Confirm the card falls back to the
    most recently active session rather than clearing.
 6. Config lands in `%APPDATA%\agent-presence\`, not `~/.config`.
+7. The single-instance lock has no `flock` here and falls back to hard-linking the pid
+   file into place. Start two daemons at once and confirm exactly one survives — this is
+   the one guarantee that is implemented differently per platform.
+
+## Several sessions at once (the case that regressed)
+
+Open four agent sessions across both agents and keep all of them working.
+
+1. `agent-presence sessions` lists all four, marks exactly one with `▸`, and the same
+   session keeps the mark for minutes at a time. The card flipping between projects on
+   every tick is the bug this replaced.
+2. Stop working in the marked session. Within roughly ten seconds of silence the mark
+   moves to whichever session is still busy.
+3. Focus a terminal running one of the others. The card follows it on the next tick,
+   regardless of the ten-second rule — focus is an instruction, not a race.
+4. `agent-presence off` clears the card within a couple of seconds **without** restarting
+   the daemon, and `on` brings it back. This is the config reload, and nothing else
+   exercises it.
 
 ## Non-interference (must pass on both)
 

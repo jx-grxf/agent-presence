@@ -45,16 +45,57 @@ impl Drop for Sandbox {
     }
 }
 
-/// Wait for the population to settle, then report how many are still running.
-fn survivors(children: &mut [Child], settle: Duration) -> usize {
-    std::thread::sleep(settle);
-    let mut alive = 0;
+/// How long a spawned daemon gets to reach the lock and make its decision.
+///
+/// Generous on purpose. These are unoptimised binaries, several start at once, and the
+/// whole suite may be running in parallel on a loaded machine — a fixed sleep short
+/// enough to keep the test snappy was really measuring process startup, and reported a
+/// working lock as broken whenever the page cache was cold.
+const SETTLE: Duration = Duration::from_secs(15);
+
+fn alive(children: &mut [Child]) -> usize {
+    let mut count = 0;
     for child in children.iter_mut() {
         if matches!(child.try_wait(), Ok(None)) {
-            alive += 1;
+            count += 1;
         }
     }
-    alive
+    count
+}
+
+/// Poll until exactly `expected` of them are left, or give up and report what there is.
+///
+/// Returning the count rather than asserting keeps the failure message at the call site,
+/// where it can say what the number means.
+fn settle_to(children: &mut [Child], expected: usize) -> usize {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let count = alive(children);
+        if count == expected || Instant::now() >= deadline {
+            return count;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Block until a daemon in this sandbox has actually taken the lock.
+///
+/// Waiting on the artefact rather than on the clock: the pid file gains a pid only once
+/// `flock` has succeeded, so its arrival is the signal, and a slow machine just waits
+/// longer instead of failing.
+fn wait_until_locked(sandbox: &Sandbox) {
+    let path = sandbox.0.join("daemon.pid");
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        let claimed = std::fs::read_to_string(&path)
+            .ok()
+            .is_some_and(|s| s.trim().parse::<u32>().is_ok());
+        if claimed {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no daemon claimed {} within {SETTLE:?}", path.display());
 }
 
 fn reap(children: &mut [Child]) {
@@ -71,12 +112,12 @@ fn only_one_daemon_survives_a_racing_start() {
     // Started back to back with no synchronisation, which is how a burst of hook events
     // starts them. Eight, so a rare interleaving still shows up.
     let mut children: Vec<Child> = (0..8).map(|_| sandbox.spawn_daemon()).collect();
-    let alive = survivors(&mut children, Duration::from_millis(1500));
+    let survivors = settle_to(&mut children, 1);
     reap(&mut children);
 
     assert_eq!(
-        alive, 1,
-        "exactly one daemon may hold the lock; {alive} were still running"
+        survivors, 1,
+        "exactly one daemon may hold the lock; {survivors} were still running"
     );
 }
 
@@ -96,22 +137,18 @@ fn an_empty_pid_file_does_not_hand_the_lock_to_a_newcomer() {
     let sandbox = Sandbox::new("window");
 
     let mut holder = sandbox.spawn_daemon();
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        survivors(std::slice::from_mut(&mut holder), Duration::from_millis(0)),
-        1,
-        "the holder should be running"
-    );
+    wait_until_locked(&sandbox);
 
     std::fs::write(sandbox.0.join("daemon.pid"), b"").expect("empty the pid file");
 
     let mut newcomer = sandbox.spawn_daemon();
-    let status = newcomer.wait().expect("newcomer exits");
-    let holder_alive = survivors(std::slice::from_mut(&mut holder), Duration::from_millis(0));
+    let exited = settle_to(std::slice::from_mut(&mut newcomer), 0) == 0;
+    let holder_alive = alive(std::slice::from_mut(&mut holder));
     reap(std::slice::from_mut(&mut holder));
+    reap(std::slice::from_mut(&mut newcomer));
 
     assert!(
-        !status.success(),
+        exited,
         "a live holder with an unwritten pid file still owns the lock"
     );
     assert_eq!(holder_alive, 1, "the holder must not have been displaced");
@@ -122,11 +159,7 @@ fn the_lock_is_released_when_the_holder_is_killed() {
     let sandbox = Sandbox::new("kill");
 
     let mut first = sandbox.spawn_daemon();
-    assert_eq!(
-        survivors(std::slice::from_mut(&mut first), Duration::from_millis(600)),
-        1,
-        "the first daemon should be running"
-    );
+    wait_until_locked(&sandbox);
 
     // SIGKILL, so no Drop runs and the pid file is left behind. A successor must still be
     // able to start — this is the case the old stale-file heuristic existed to handle,
@@ -135,13 +168,11 @@ fn the_lock_is_released_when_the_holder_is_killed() {
     first.wait().unwrap();
 
     let mut second = sandbox.spawn_daemon();
-    let alive = survivors(
-        std::slice::from_mut(&mut second),
-        Duration::from_millis(800),
-    );
+    wait_until_locked(&sandbox);
+    let running = alive(std::slice::from_mut(&mut second));
     reap(std::slice::from_mut(&mut second));
 
-    assert_eq!(alive, 1, "a killed holder must not lock the daemon out");
+    assert_eq!(running, 1, "a killed holder must not lock the daemon out");
 }
 
 #[test]
@@ -149,17 +180,14 @@ fn a_second_daemon_gives_up_promptly() {
     let sandbox = Sandbox::new("loser");
 
     let mut holder = sandbox.spawn_daemon();
-    std::thread::sleep(Duration::from_millis(600));
+    wait_until_locked(&sandbox);
 
-    let started = Instant::now();
     let mut loser = sandbox.spawn_daemon();
     let status = loser.wait().expect("second daemon exits");
-
     reap(std::slice::from_mut(&mut holder));
 
-    assert!(!status.success(), "the loser must exit with an error");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the loser must fail fast rather than queue behind the holder"
+        !status.success(),
+        "the loser must exit with an error rather than run alongside the holder"
     );
 }

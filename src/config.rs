@@ -44,9 +44,15 @@ pub struct Config {
     /// at. Turn off to always show the most recently active session instead.
     pub follow_focus: bool,
     /// Let the daemon ask GitHub once a day whether a newer release exists, so `status`
-    /// and `doctor` can say so. Nothing is ever installed without `agent-presence
-    /// update` being run by hand.
+    /// and `doctor` can say so. Nothing is installed unless `auto_update` says so.
     pub update_check: bool,
+    /// Install a newer release on the daemon's own initiative.
+    ///
+    /// Off by default, and it never overwrites the binary itself — it runs whatever
+    /// package manager owns the install, the same way `agent-presence update` does, and
+    /// only while no session is live so it cannot pull the binary out from under a turn
+    /// in progress. A standalone binary has no owner to delegate to, so nothing happens.
+    pub auto_update: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +73,7 @@ impl Default for Config {
             enabled: true,
             follow_focus: true,
             update_check: true,
+            auto_update: false,
         }
     }
 }
@@ -227,19 +234,24 @@ pub fn log_path() -> PathBuf {
 /// the first is listening on, and `Listener::bind` unlinks whatever it finds.
 pub fn control_socket_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("AGENT_PRESENCE_HOME") {
-        let dir = PathBuf::from(explicit);
         #[cfg(windows)]
         {
             // Named pipes are not filesystem paths, so isolate by name instead.
-            let key: String = dir
-                .to_string_lossy()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
+            let key = short_key(&explicit);
             return PathBuf::from(format!(r"\\.\pipe\agent-presence-{key}"));
         }
         #[cfg(unix)]
-        return dir.join("control.sock");
+        {
+            let inside = PathBuf::from(&explicit).join("control.sock");
+            // A socket path is copied into `sockaddr_un.sun_path`, which is 104 bytes on
+            // macOS and 108 on Linux — shorter than plenty of legitimate directories, and
+            // exceeding it fails the bind rather than truncating. So a deep home falls
+            // back to a short name derived from it, which is still unique per home.
+            if inside.as_os_str().len() < 100 {
+                return inside;
+            }
+            return system_temp_dir().join(format!("agent-presence-{}.sock", short_key(&explicit)));
+        }
     }
     #[cfg(windows)]
     {
@@ -247,9 +259,6 @@ pub fn control_socket_path() -> PathBuf {
     }
     #[cfg(unix)]
     {
-        let dir = std::env::var_os("TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
         // Include the user so two accounts on one machine never collide. On macOS
         // $TMPDIR is already per-user, but Linux /tmp is shared.
         let user: String = std::env::var("USER")
@@ -257,8 +266,29 @@ pub fn control_socket_path() -> PathBuf {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .collect();
-        dir.join(format!("agent-presence-{user}.sock"))
+        system_temp_dir().join(format!("agent-presence-{user}.sock"))
     }
+}
+
+#[cfg(unix)]
+fn system_temp_dir() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// A short, stable, filename-safe key for an arbitrary string.
+///
+/// FNV-1a, because this only has to avoid collisions between a handful of directories on
+/// one machine — nothing here is security-sensitive, and a hashing dependency for it would
+/// be absurd in a binary this size.
+fn short_key(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// `idle_timeout = "15m"` in TOML, `Duration` in Rust.
@@ -378,6 +408,30 @@ mod tests {
         );
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.idle_timeout, c.idle_timeout);
+    }
+
+    /// `sockaddr_un.sun_path` is 104 bytes on macOS and 108 on Linux. Overrunning it does
+    /// not truncate, it fails the bind — and a daemon that cannot bind exits silently.
+    #[cfg(unix)]
+    #[test]
+    fn a_deep_home_still_yields_a_bindable_socket_path() {
+        let deep = std::env::temp_dir().join("a".repeat(120));
+        std::env::set_var("AGENT_PRESENCE_HOME", &deep);
+        let path = control_socket_path();
+        std::env::remove_var("AGENT_PRESENCE_HOME");
+
+        assert!(
+            path.as_os_str().len() < 104,
+            "socket path is {} bytes: {}",
+            path.as_os_str().len(),
+            path.display()
+        );
+    }
+
+    #[test]
+    fn two_homes_never_share_a_socket() {
+        assert_ne!(short_key("/one/home"), short_key("/another/home"));
+        assert_eq!(short_key("/one/home"), short_key("/one/home"));
     }
 
     #[test]

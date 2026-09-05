@@ -100,6 +100,28 @@ impl Registry {
         }
     }
 
+    /// Everything the daemon is tracking, for `agent-presence sessions` and the settings
+    /// editor. Ordered with the session on the card first, then by how recently each was
+    /// active, so the list reads the same way every time it is printed.
+    pub fn describe(&self) -> Vec<crate::ipc::SessionInfo> {
+        let now = Instant::now();
+        let mut out: Vec<crate::ipc::SessionInfo> = self
+            .sessions
+            .iter()
+            .map(|(id, s)| crate::ipc::SessionInfo {
+                agent: s.agent,
+                activity: s.activity,
+                cwd: s.cwd.clone(),
+                model: s.model.clone(),
+                quiet_secs: now.duration_since(s.last_seen).as_secs(),
+                age_secs: now.duration_since(s.started).as_secs(),
+                on_card: self.primary.as_deref() == Some(id.as_str()),
+            })
+            .collect();
+        out.sort_by_key(|s| (!s.on_card, s.quiet_secs));
+        out
+    }
+
     /// Drop sessions whose agent died without firing `SessionEnd`.
     pub fn expire(&mut self, idle_timeout: Duration) -> usize {
         let now = Instant::now();

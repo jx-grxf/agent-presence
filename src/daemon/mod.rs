@@ -10,13 +10,13 @@ pub mod presence;
 pub mod registry;
 
 use crate::config::{self, Config};
-use crate::discord::DiscordClient;
+use crate::discord::{self, DiscordClient};
 use crate::event::HookEvent;
 use crate::ipc;
 use anyhow::{Context, Result};
 use registry::Registry;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 /// Minimum spacing between `SET_ACTIVITY` calls. Comfortably inside Discord's limit.
@@ -26,6 +26,62 @@ const TICK: Duration = Duration::from_secs(2);
 const SHUTDOWN_AFTER_IDLE: Duration = Duration::from_secs(90);
 /// Ceiling on the focused-window query, so a stalled terminal cannot stall the tick.
 const FOCUS_TIMEOUT: Duration = Duration::from_millis(800);
+/// How long to wait for Discord to take the card down before exiting anyway.
+const CLEAR_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What reaches the event loop from a control connection.
+enum Incoming {
+    Event(HookEvent),
+    /// A query, with the channel to answer it on. Handled in the loop because that is
+    /// where the registry lives.
+    Sessions(tokio::sync::oneshot::Sender<ipc::SessionsReply>),
+}
+
+/// Read one control connection to the end, forwarding what it carries to the event loop.
+async fn serve<S>(stream: S, tx: mpsc::Sender<Incoming>) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        // A bare event is what a hook from an older build sends. The binaries upgrade
+        // together but the daemon outlives the upgrade, so both shapes have to work.
+        let request = match serde_json::from_str::<ipc::Request>(&line) {
+            Ok(r) => r,
+            Err(envelope_error) => match serde_json::from_str::<HookEvent>(&line) {
+                Ok(event) => ipc::Request::Event {
+                    event: Box::new(event),
+                },
+                Err(_) => {
+                    tracing::warn!("unparseable control message: {envelope_error}");
+                    continue;
+                }
+            },
+        };
+
+        match request {
+            ipc::Request::Event { event } => {
+                if tx.send(Incoming::Event(*event)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            ipc::Request::Sessions => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if tx.send(Incoming::Sessions(reply_tx)).await.is_err() {
+                    return Ok(());
+                }
+                let reply = reply_rx.await.context("event loop dropped the query")?;
+                let mut body = serde_json::to_vec(&reply)?;
+                body.push(b'\n');
+                writer.write_all(&body).await?;
+                writer.flush().await?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// The config as the daemon sees it: reloaded when the file changes, with the privacy
 /// globs compiled once rather than on every tick.
@@ -47,18 +103,19 @@ impl LiveConfig {
 
     /// Pick up hand edits and `agent-presence config` without a restart. One `stat` per
     /// tick; the file is only read when its mtime actually moved.
-    fn reload_if_changed(&mut self) -> bool {
+    ///
+    /// A changed `client_id` needs no handling here: it rides along on every presence
+    /// update, and the task that owns the connection reconnects when it sees a new one.
+    fn reload_if_changed(&mut self) {
         let stamp = file_stamp();
         if stamp == self.stamp {
-            return false;
+            return;
         }
         self.stamp = stamp;
         let config = Config::load();
         self.hidden = config.hidden_matcher();
-        let client_id_changed = config.effective_client_id() != self.config.effective_client_id();
         self.config = config;
         tracing::info!("config reloaded");
-        client_id_changed
     }
 }
 
@@ -73,7 +130,7 @@ pub async fn run() -> Result<()> {
     let mut live = LiveConfig::load();
     let socket = config::control_socket_path();
 
-    let (tx, mut rx) = mpsc::channel::<HookEvent>(256);
+    let (tx, mut rx) = mpsc::channel::<Incoming>(256);
 
     #[allow(unused_mut)]
     let mut listener = ipc::Listener::bind(&socket).await?;
@@ -85,16 +142,8 @@ pub async fn run() -> Result<()> {
                     // One connection may carry several lines; a slow client must not
                     // hold up the next hook, so each is handled independently.
                     tokio::spawn(async move {
-                        let mut lines = BufReader::new(stream).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            match serde_json::from_str::<HookEvent>(&line) {
-                                Ok(event) => {
-                                    if tx.send(event).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(e) => tracing::warn!("unparseable event: {e}"),
-                            }
+                        if let Err(e) = serve(stream, tx).await {
+                            tracing::debug!("control connection ended: {e:#}");
                         }
                     });
                 }
@@ -117,23 +166,39 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    let mut client = DiscordClient::new(live.config.effective_client_id());
+    // Discord talks over a socket that can take seconds to answer — probing ten IPC slots
+    // with the app closed, or waiting out a handshake — and every one of those seconds was
+    // spent inside the `select!` arm, so the daemon serviced no events and no queries
+    // while it happened. `agent-presence sessions` timed out against a daemon that was
+    // running perfectly well. The connection now lives in its own task and the loop only
+    // publishes what it wants shown.
+    let (presence_tx, presence_rx) = mpsc::channel::<PresenceUpdate>(4);
+    let presence = tokio::spawn(drive_presence(presence_rx));
+
     let mut registry = Registry::default();
     let mut ticker = tokio::time::interval(TICK);
     let mut idle_since: Option<std::time::Instant> = Some(std::time::Instant::now());
 
     loop {
         tokio::select! {
-            Some(event) = rx.recv() => {
-                tracing::debug!(?event.kind, session = %event.session_id, "event");
-                registry.apply(event);
+            Some(incoming) = rx.recv() => {
+                match incoming {
+                    Incoming::Event(event) => {
+                        tracing::debug!(?event.kind, session = %event.session_id, "event");
+                        registry.apply(event);
+                    }
+                    // Answering from here rather than from the connection task is what
+                    // keeps the registry single-owner and lock-free.
+                    Incoming::Sessions(reply) => {
+                        let _ = reply.send(ipc::SessionsReply {
+                            sessions: registry.describe(),
+                            card_enabled: live.config.enabled,
+                        });
+                    }
+                }
             }
             _ = ticker.tick() => {
-                if live.reload_if_changed() {
-                    // A different application means a different connection entirely.
-                    let _ = client.set_activity(None).await;
-                    client = DiscordClient::new(live.config.effective_client_id());
-                }
+                live.reload_if_changed();
                 let config = &live.config;
                 registry.expire(config.idle_timeout);
 
@@ -149,16 +214,28 @@ pub async fn run() -> Result<()> {
                     .filter(|_| config.enabled)
                     .map(|snap| presence::build(&snap, config, &live.hidden));
 
-                if let Err(e) = client.set_activity(desired).await {
-                    // Expected whenever Discord is closed. Stay alive and retry.
-                    tracing::debug!("presence update deferred: {e:#}");
-                }
+                // `try_send`, so a Discord round trip that has not finished cannot
+                // hold up the tick. Presence is latest-wins: if the queue is full the
+                // task is already behind and the next tick supersedes this one anyway.
+                let _ = presence_tx.try_send(PresenceUpdate {
+                    client_id: config.effective_client_id(),
+                    activity: desired,
+                });
 
                 if registry.is_empty() {
                     let since = idle_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() > SHUTDOWN_AFTER_IDLE {
                         tracing::info!("no sessions for {SHUTDOWN_AFTER_IDLE:?}, exiting");
-                        let _ = client.set_activity(None).await;
+                        clear_card(presence_tx, presence).await;
+                        // On the way out is the safest possible moment to replace the
+                        // binary: no session is live, and we are about to release the
+                        // lock anyway, so the next hook event starts the new build.
+                        if live.config.auto_update && live.config.update_check {
+                            let _ = tokio::task::spawn_blocking(
+                                crate::update::auto_install_if_available,
+                            )
+                            .await;
+                        }
                         return Ok(());
                     }
                 } else {
@@ -167,11 +244,73 @@ pub async fn run() -> Result<()> {
             }
             _ = shutdown_signal() => {
                 tracing::info!("shutting down");
-                let _ = client.set_activity(None).await;
+                clear_card(presence_tx, presence).await;
                 return Ok(());
             }
         }
     }
+}
+
+/// What the event loop wants shown, handed to the task that owns the Discord connection.
+struct PresenceUpdate {
+    /// Carried per update so a `client_id` changed in the config takes effect without the
+    /// loop having to reach into the connection.
+    client_id: String,
+    activity: Option<discord::Activity>,
+}
+
+/// Own the Discord connection and push whatever the loop last asked for.
+///
+/// Every slow thing about Discord lives in here: connecting, the handshake, waiting for
+/// the echo of a `SET_ACTIVITY`, and reconnecting after the app quits. None of it can
+/// delay an event or a query any more.
+async fn drive_presence(mut updates: mpsc::Receiver<PresenceUpdate>) {
+    let mut client: Option<(String, DiscordClient)> = None;
+
+    while let Some(update) = updates.recv().await {
+        let reconnect = client
+            .as_ref()
+            .is_none_or(|(id, _)| *id != update.client_id);
+        if reconnect {
+            // A different application is a different connection; clear the old card
+            // first so it does not linger under the previous identity.
+            if let Some((_, old)) = client.as_mut() {
+                let _ = old.set_activity(None).await;
+            }
+            client = Some((
+                update.client_id.clone(),
+                DiscordClient::new(update.client_id),
+            ));
+        }
+
+        if let Some((_, client)) = client.as_mut() {
+            if let Err(e) = client.set_activity(update.activity).await {
+                // Expected whenever Discord is closed. Stay alive and retry next tick.
+                tracing::debug!("presence update deferred: {e:#}");
+            }
+        }
+    }
+}
+
+/// Take the card down and wait for Discord to acknowledge it, within reason.
+///
+/// Worth waiting for: leaving a stale card up is exactly what a user notices, and the
+/// process is about to exit anyway. Not worth waiting forever, since Discord being
+/// unreachable is the ordinary reason this would hang.
+async fn clear_card(tx: mpsc::Sender<PresenceUpdate>, task: tokio::task::JoinHandle<()>) {
+    let cleared = tx
+        .send(PresenceUpdate {
+            client_id: Config::load().effective_client_id(),
+            activity: None,
+        })
+        .await
+        .is_ok();
+    if !cleared {
+        return;
+    }
+    // Dropping the last sender ends the task's loop once it has drained the queue.
+    drop(tx);
+    let _ = tokio::time::timeout(CLEAR_TIMEOUT, task).await;
 }
 
 /// Resolve the focused terminal off the event loop. The query shells out to
