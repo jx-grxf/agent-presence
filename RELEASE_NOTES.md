@@ -4,6 +4,19 @@ The section matching the tag being built becomes the body of the GitHub release.
 Add a new `## vX.Y.Z` heading before tagging; a tag with no section here still
 releases, it just carries the generated changelog alone.
 
+## v0.3.1
+
+**Cursor blocked every tool call while the hooks were installed.** Cursor also runs the
+hooks it finds in `~/.claude/settings.json`, but it ignores the `args` array the installer
+wrote for Claude Code. It started the bare binary, which printed the setup wizard where
+Cursor expects JSON, and Cursor refused the tool call. The hook is now a single command
+string, as it already was for Codex. Run `agent-presence install` once to rewrite
+existing entries; the plugin ships the same fix.
+
+**`agent-presence` without a command stays quiet when it is not run from a terminal.**
+A hook runner that drops the arguments now gets no output and exit code 0 instead of the
+wizard.
+
 ## v0.3.0
 
 **The card stopped switching between sessions on its own.** With several agents live it

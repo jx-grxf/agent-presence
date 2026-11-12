@@ -328,21 +328,18 @@ fn add_hooks(root: &mut Value, agent: Agent) -> Result<bool> {
 }
 
 fn hook_entry(agent: Agent, exe: &str) -> Value {
-    let handler = match agent {
-        // Claude Code supports the exec form, which sidesteps shell quoting entirely.
-        Agent::Claude => json!({
-            "type": "command",
-            "command": exe,
-            "args": ["hook", "--agent", "claude"],
-            "timeout": 5
-        }),
-        // Codex takes a single command string.
-        Agent::Codex => json!({
-            "type": "command",
-            "command": format!("\"{exe}\" hook --agent codex"),
-            "timeout": 5
-        }),
+    // A single command string, not Claude Code's exec form: Cursor loads the hooks from
+    // ~/.claude/settings.json too but drops `args`, so it ran the bare binary, got the
+    // setup wizard on stdout instead of JSON and blocked every tool call.
+    let name = match agent {
+        Agent::Claude => "claude",
+        Agent::Codex => "codex",
     };
+    let handler = json!({
+        "type": "command",
+        "command": format!("\"{exe}\" hook --agent {name}"),
+        "timeout": 5
+    });
     json!({ "hooks": [handler] })
 }
 
@@ -607,14 +604,49 @@ mod tests {
     }
 
     #[test]
-    fn codex_uses_a_single_command_string() {
-        let mut root = json!({});
-        add_hooks(&mut root, Agent::Codex).unwrap();
-        let handler = &root["hooks"]["PreToolUse"][0]["hooks"][0];
-        assert!(handler["args"].is_null(), "Codex takes no args array");
-        assert!(handler["command"]
-            .as_str()
-            .unwrap()
-            .contains("--agent codex"));
+    fn both_agents_use_a_single_command_string() {
+        for (agent, flag) in [
+            (Agent::Claude, "--agent claude"),
+            (Agent::Codex, "--agent codex"),
+        ] {
+            let mut root = json!({});
+            add_hooks(&mut root, agent).unwrap();
+            let handler = &root["hooks"]["SessionStart"][0]["hooks"][0];
+            assert!(handler["args"].is_null(), "Cursor ignores an args array");
+            assert!(handler["command"].as_str().unwrap().ends_with(flag));
+        }
+    }
+
+    #[test]
+    fn reinstalling_rewrites_an_old_exec_form_entry() {
+        let mut root = json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/opt/homebrew/bin/agent-presence",
+                        "args": ["hook", "--agent", "claude"],
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+        assert!(add_hooks(&mut root, Agent::Claude).unwrap());
+        let list = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "the old entry is replaced, not duplicated");
+        assert!(list[0]["hooks"][0]["args"].is_null());
+    }
+
+    #[test]
+    fn the_plugin_hooks_use_a_single_command_string() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin/hooks/hooks.json");
+        let root: Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+        for groups in root["hooks"].as_object().unwrap().values() {
+            for handler in groups[0]["hooks"].as_array().unwrap() {
+                assert!(handler["args"].is_null(), "Cursor ignores an args array");
+                assert_eq!(handler["command"], "agent-presence hook --agent claude");
+            }
+        }
     }
 }
