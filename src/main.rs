@@ -13,6 +13,7 @@ mod update;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use event::Agent;
+use std::io::IsTerminal;
 
 /// Default Discord Application ID. Public value, not a secret — Rich Presence
 /// authenticates through the logged-in Discord desktop client, never a token.
@@ -85,6 +86,11 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let Some(command) = Cli::parse().command else {
+        // Piped stdin means a hook runner started us and dropped the arguments. Printing
+        // the wizard there puts text where JSON is expected, and Cursor blocks the tool.
+        if !std::io::stdin().is_terminal() {
+            return Ok(());
+        }
         init_logging(false);
         // Probe Discord before the wizard takes over the screen: the answer cannot
         // change while it is open, and an async call inside a draw callback cannot.
